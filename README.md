@@ -24,6 +24,14 @@ instructions in the [INSTALL.md](INSTALL.md) file. To compile or run provided
 example applications, see the [README.md](examples/README.md) file in the
 *examples* folder.
 
+### Experimental Features
+
+1. DRAGON-DIRECT
+   - Use DMA to transfer data from NVMe to GPU.
+   - No host page caching in between.
+   - Tracking in branch [dev-nvme-gpudirect](https://github.com/pakmarkthub/dragon/tree/dev-nvme-gpudirect).
+   - [Documentation](docs/DRAGON-DIRECT.md).
+
 ## Versioning
 
 For the versions available, see the [tags on this repository](https://github.com/pakmarkthub/dragon/tags). 
