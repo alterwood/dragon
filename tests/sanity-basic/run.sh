@@ -50,4 +50,8 @@ echo "==> size_in_gib,tpb,seed,rw: $size_in_gib,$threads_per_block,$seed,r"
 ../../drop-caches.sh
 ./bin/read $backing_file $size_in_gib $threads_per_block $seed
 echo "========================="
+echo "==> size_in_gib,tpb,seed,rw: $size_in_gib,$threads_per_block,$seed,r"
+../../drop-caches.sh
+./bin/read-direct $backing_file $size_in_gib $threads_per_block $seed
+echo "========================="
 
