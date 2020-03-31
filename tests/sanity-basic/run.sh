@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR_PATH="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PROJECT_PATH="${SCRIPT_DIR_PATH}/../.."
+
 backing_file=""
 size_in_gib=22
 
@@ -43,15 +46,15 @@ threads_per_block=1024
 
 seed=$RANDOM
 echo "==> size_in_gib,tpb,seed,rw: $size_in_gib,$threads_per_block,$seed,w"
-../../drop-caches.sh
-./bin/write $backing_file $size_in_gib $threads_per_block $seed
+${PROJECT_PATH}/scripts/drop-caches
+${SCRIPT_DIR_PATH}/bin/write $backing_file $size_in_gib $threads_per_block $seed
 echo "========================="
 echo "==> size_in_gib,tpb,seed,rw: $size_in_gib,$threads_per_block,$seed,r"
-../../drop-caches.sh
-./bin/read $backing_file $size_in_gib $threads_per_block $seed
+${PROJECT_PATH}/scripts/drop-caches
+${SCRIPT_DIR_PATH}/bin/read $backing_file $size_in_gib $threads_per_block $seed
 echo "========================="
 echo "==> size_in_gib,tpb,seed,rw: $size_in_gib,$threads_per_block,$seed,r"
-../../drop-caches.sh
-./bin/read-direct $backing_file $size_in_gib $threads_per_block $seed
+${PROJECT_PATH}/scripts/drop-caches
+${SCRIPT_DIR_PATH}/bin/read-direct $backing_file $size_in_gib $threads_per_block $seed
 echo "========================="
 
