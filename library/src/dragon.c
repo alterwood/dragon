@@ -55,9 +55,9 @@ typedef struct
 typedef struct
 {
     int backing_fd;
-    void *uvm_addr;
+    uint64_t uvm_addr;
     size_t size;
-    unsigned short flags;
+    unsigned int flags;
     unsigned int status;
 } dragon_ioctl_map_t;
 
@@ -151,7 +151,7 @@ static dragonError_t init_module()
     return D_OK;
 }
 
-dragonError_t dragon_map(const char *filename, size_t size, unsigned short flags, void **addr)
+dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, void **addr)
 {
     int f_flags = 0;
     int f_fd;
@@ -159,6 +159,7 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned short flags
     cudaError_t error;
     int status;
     int ret = D_OK;
+    void *uvm_buf;
 
     if ((request = (dragon_ioctl_map_t *)calloc(1, sizeof(dragon_ioctl_map_t))) == NULL)
     {
@@ -167,7 +168,7 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned short flags
         goto _out_err_0;
     }
 
-    error = cudaMallocManaged(&request->uvm_addr, size >= MIN_SIZE ? size : MIN_SIZE, cudaMemAttachGlobal);
+    error = cudaMallocManaged(&uvm_buf, size >= MIN_SIZE ? size : MIN_SIZE, cudaMemAttachGlobal);
     if (error != cudaSuccess)
     {
         fprintf(stderr, "cudaMallocManaged error: %s %s\n", cudaGetErrorName(error), cudaGetErrorString(error));
@@ -183,10 +184,22 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned short flags
     }
 
     f_flags = O_RDWR | O_LARGEFILE;
-    if (flags & D_F_CREATE) {
+    if (flags & D_F_CREATE) 
+    {
         f_fd = creat(filename, S_IRUSR | S_IWUSR);
         if (f_fd >= 0)
             close(f_fd);
+    }
+
+    if (flags & D_F_DIRECT)
+    {
+        if (flags & ~(D_F_READ | D_F_DIRECT | D_F_CREATE))
+        {
+            fprintf(stderr, "D_F_DIRECT is not compatible with other flags except D_F_READ\n");
+            ret = D_ERR_INTVAL;
+            goto _out_err_2;
+        }
+        f_flags |= O_DIRECT;
     }
 
     if ((request->backing_fd = open(filename, f_flags)) < 0)
@@ -203,6 +216,7 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned short flags
         goto _out_err_3;
     }
 
+    request->uvm_addr = (uint64_t)uvm_buf;
     request->flags = flags;
     request->size = size;
 
@@ -221,23 +235,23 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned short flags
         goto _out_err_3;
     }
 
-    *addr = request->uvm_addr;
+    *addr = (void *)request->uvm_addr;
 
-    g_hash_table_insert(addr_map, request->uvm_addr, request);
+    g_hash_table_insert(addr_map, *addr, request);
 
     return D_OK;
 
 _out_err_3:
     close(request->backing_fd);
 _out_err_2:
-    cudaFree(request->uvm_addr);
+    cudaFree(uvm_buf);
 _out_err_1:
     free(request);
 _out_err_0:
     return ret;
 }
 
-dragonError_t dragon_remap(void *addr, unsigned short flags)
+dragonError_t dragon_remap(void *addr, unsigned int flags)
 {
     int status;
     dragon_ioctl_map_t *request = g_hash_table_lookup(addr_map, addr);
