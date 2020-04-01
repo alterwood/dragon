@@ -84,7 +84,7 @@ See https://elixir.bootlin.com/linux/v5.4.28/source/drivers/pci/p2pdma.c#L276.
 has this feature implemented.
 
 We add one more flag called *D_F_DIRECT*. Look at
-[read-direct.cu](../sanity-basic/read-direct.cu) for example code.
+[read-direct.cu](../tests/sanity-basic/read-direct.cu) for example code.
 
 ## Current limitations
 
