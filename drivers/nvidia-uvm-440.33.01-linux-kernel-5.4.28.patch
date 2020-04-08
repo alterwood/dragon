@@ -114,16 +114,18 @@ index fad4ac3..4addb83 100644
          uvm_va_space_up_read(va_space);
 diff --git a/kernel/nvidia-uvm/uvm8_nvmgpu.c b/kernel/nvidia-uvm/uvm8_nvmgpu.c
 new file mode 100644
-index 0000000..6be547f
+index 0000000..537fd0e
 --- /dev/null
 +++ b/kernel/nvidia-uvm/uvm8_nvmgpu.c
-@@ -0,0 +1,1563 @@
+@@ -0,0 +1,1806 @@
 +#include <linux/syscalls.h>
 +#include <linux/delay.h>
 +#include <linux/aio.h>
 +#include <linux/swap.h>
 +#include <linux/writeback.h>
 +#include <linux/fs.h>
++#include <linux/fsnotify.h>
++#include <linux/sched/xacct.h>
 +#include <linux/backing-dev.h>
 +#include <linux/pci-p2pdma.h>
 +
@@ -463,9 +465,9 @@ index 0000000..6be547f
 +    // Check compatibility if request DIRECT flag.
 +    if (params->flags & UVM_NVMGPU_FLAG_DIRECT)
 +    {
-+        if (params->flags & ~(UVM_NVMGPU_FLAG_DIRECT | UVM_NVMGPU_FLAG_READ))
++        if (params->flags & ~(UVM_NVMGPU_FLAG_DIRECT | UVM_NVMGPU_FLAG_READ | UVM_NVMGPU_FLAG_WRITE))
 +        {
-+            printk(KERN_DEBUG "DIRECT flag can be used with READ flag only\n");
++            printk(KERN_DEBUG "DIRECT flag can be used with READ and/or WRITE flags only\n");
 +            ret = NV_ERR_NOT_SUPPORTED;
 +            goto error;
 +        }
@@ -1087,10 +1089,10 @@ index 0000000..6be547f
 +
 +    // Read from the file into RM memory on GPU.
 +    // It uses direct_io in the background because the file is opened with O_DIRECT.
-+    retcode = filp->f_op->read_iter(&kiocb, &iter);
++    retcode = call_read_iter(filp, &kiocb, &iter);
 +    if (retcode < 0)
 +    {
-+        printk(KERN_DEBUG "error in read_iter with code %ld\n", retcode);
++        printk(KERN_DEBUG "error in call_read_iter with code %ld\n", retcode);
 +        return NV_ERR_OPERATING_SYSTEM;
 +    }
 +
@@ -1165,7 +1167,7 @@ index 0000000..6be547f
 +    uvm_push_t push;
 +
 +    uvm_page_index_t page_idx;
-+    uvm_page_index_t page_idx_start = -1;
++    int page_idx_start = -1;
 +    int num_pages = 0;
 +
 +    // Nothing in the page_mask. 
@@ -1175,7 +1177,7 @@ index 0000000..6be547f
 +    // Initiate a GPU command push channel.
 +    status = uvm_push_begin_acquire(
 +        gpu->channel_manager, 
-+        UVM_CHANNEL_TYPE_CPU_TO_GPU, 
++        UVM_CHANNEL_TYPE_GPU_INTERNAL, 
 +        &va_block->tracker,
 +        &push, 
 +        "nvmgpu copy rm buf to chunk(s)"
@@ -1228,6 +1230,208 @@ index 0000000..6be547f
 +    return status;
 +}
 +
++static NV_STATUS nvmgpu_direct_io_write_range(
++    uvm_va_block_t *va_block, uvm_gpu_t *gpu, 
++    uvm_page_index_t page_index_start, int num_pages,
++    size_t *written_bytes
++)
++{
++    uvm_va_range_t *va_range = va_block->va_range;
++    uvm_va_space_t *va_space = va_range->va_space;
++
++    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
++    uvm_nvmgpu_gpu_direct_t *gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu->id)];
++
++    uvm_nvmgpu_va_range_t *nvmgpu_va_range = va_range->nvmgpu_va_range;
++
++    struct file *filp = nvmgpu_va_range->filp;
++    struct kiocb kiocb;
++    struct iov_iter iter;
++    ssize_t retcode;
++
++    // Calculate the file offset and write size.
++    loff_t file_start_offset = va_block->start - va_range->node.start + page_index_start * PAGE_SIZE;
++    size_t write_size = MIN(num_pages * PAGE_SIZE, uvm_va_range_size(va_range) - file_start_offset);
++
++    // Prepare write descriptor.
++    iov_iter_bvec(&iter, WRITE, &gpu_direct->bvecs[page_index_start], num_pages, write_size);
++
++    init_sync_kiocb(&kiocb, filp);
++    kiocb.ki_pos = file_start_offset;
++
++    // Write from RM memory to the file.
++    // It uses direct_io in the background because the file is opened with O_DIRECT.
++    retcode = call_write_iter(filp, &kiocb, &iter);
++    if (retcode < 0)
++    {
++        printk(KERN_DEBUG "error in call_write_iter with code %ld\n", retcode);
++        return NV_ERR_OPERATING_SYSTEM;
++    }
++
++    UVM_ASSERT(retcode == write_size);
++
++    *written_bytes = retcode;
++
++    return NV_OK;
++}
++
++static NV_STATUS nvmgpu_direct_io_write_from_gpu(uvm_va_block_t *va_block, uvm_gpu_id_t gpu_id, const uvm_page_mask_t *page_mask)
++{
++    NV_STATUS status = NV_OK;
++
++    uvm_va_range_t *va_range = va_block->va_range;
++    uvm_va_space_t *va_space = va_range->va_space;
++
++    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
++
++    uvm_nvmgpu_gpu_direct_t *gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu_id)];
++
++    uvm_gpu_t *gpu = uvm_va_space_get_gpu(va_space, gpu_id);
++    uvm_va_block_gpu_state_t *gpu_state = va_block->gpus[uvm_id_gpu_index(gpu_id)];
++    uvm_push_t push;
++
++    uvm_page_index_t page_index;
++    int page_index_start = -1;
++    int num_pages = 0;
++    uvm_va_block_region_t region = uvm_va_block_region_from_block(va_block);
++    
++    mm_segment_t fs;
++
++    struct file *filp = va_range->nvmgpu_va_range->filp;
++    size_t file_written_bytes = 0;
++    size_t written_bytes = 0;
++
++    // Nothing in the page_mask. 
++    if (uvm_page_mask_weight(page_mask) == 0)
++        return NV_OK;
++
++    // Initiate a GPU command push channel.
++    status = uvm_push_begin_acquire(
++        gpu->channel_manager, 
++        UVM_CHANNEL_TYPE_GPU_INTERNAL, 
++        &va_block->tracker,
++        &push, 
++        "nvmgpu copy chunk(s) to rm buf"
++    );
++    if (status != NV_OK)
++    {
++        printk(KERN_DEBUG "uvm_push_begin_acquire error %s\n", nvstatusToString(status));
++        return status;
++    }
++
++    for_each_va_block_page_in_region_mask(page_index, page_mask, region)
++    {
++        uvm_gpu_address_t dst;
++        uvm_gpu_address_t src;
++
++        size_t to_copy_size;
++
++        loff_t chunk_offset;
++        uvm_chunk_size_t chunk_size;
++        size_t chunk_idx;
++        uvm_gpu_chunk_t *chunk;
++
++        uvm_page_index_t next_page_index;
++
++        chunk_idx = uvm_va_block_gpu_chunk_index_range(va_block->start, uvm_va_block_size(va_block), gpu, page_index, &chunk_size);
++        chunk = gpu_state->chunks[chunk_idx];
++
++        UVM_ASSERT(chunk);
++        UVM_ASSERT(chunk_size >= PAGE_SIZE);
++        UVM_ASSERT(chunk->va_block_page_index <= page_index);
++
++        chunk_offset = (page_index - chunk->va_block_page_index) * PAGE_SIZE;
++        to_copy_size = chunk_size - chunk_offset;
++
++        next_page_index = uvm_va_block_next_page_in_mask(region, page_mask, page_index + to_copy_size / PAGE_SIZE - 1);
++
++        // Copy the whole chunk.
++        src = uvm_gpu_address_physical(UVM_APERTURE_VID, chunk->address + chunk_offset);
++        dst = uvm_gpu_address_virtual(gpu_direct->aligned_rm_gpu_va + page_index * PAGE_SIZE);
++
++        // Pipeline all copies.
++        uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_PIPELINED);
++
++        if (next_page_index == region.outer)
++            // Last copy so include membar.gl.
++            uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_MEMBAR_GPU);
++        else
++            // In between copies, no need for membar.
++            uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_MEMBAR_NONE);
++
++        gpu->ce_hal->memcopy(&push, dst, src, to_copy_size);
++
++        // Skip all pages covered by this chunk.
++        page_index = next_page_index - 1;
++    }
++
++    // Wait for all copies to finish.
++    status = uvm_push_end_and_wait(&push);
++    if (status != NV_OK)
++    {
++        printk(KERN_DEBUG "uvm_push_end_and_wait error %s\n", nvstatusToString(status));
++        return status;
++    }
++
++    // Switch the filesystem space to kernel space.
++    fs = get_fs();
++    set_fs(KERNEL_DS);
++
++    file_start_write(filp);
++
++    for_each_va_block_page_in_mask(page_index, page_mask, va_block)
++    {
++        if (page_index_start < 0)
++        {
++            // First page.
++            page_index_start = page_index;
++            num_pages = 1;
++        }
++        else if (page_index == page_index_start + num_pages)
++            // Contiguous pages. Keep moving.
++            ++num_pages;
++        else
++        {
++            // Found a non-contiguous page.
++            // Initiate write for the previous contiguous pages.
++            status = nvmgpu_direct_io_write_range(va_block, gpu, page_index_start, num_pages, &written_bytes);
++            if (status != NV_OK)
++                goto out;
++
++            file_written_bytes += written_bytes;
++
++            // Reset index
++            page_index_start = page_index;
++            num_pages = 1;
++        }
++    }
++
++    // Do write for the last group of contiguous pages.
++    if (num_pages > 0)
++    {
++        status = nvmgpu_direct_io_write_range(va_block, gpu, page_index_start, num_pages, &written_bytes);
++        if (status != NV_OK)
++            goto out;
++
++        file_written_bytes += written_bytes;
++    }
++
++out:
++    if (file_written_bytes > 0)
++    {
++        fsnotify_modify(filp);
++        add_wchar(current, file_written_bytes);
++    }
++    inc_syscw(current);
++
++    file_end_write(filp);
++
++    // Return to the original filesystem space.
++    set_fs(fs);
++
++    return status;
++}
++
 +/**
 + * Copy data from GPUs to the backing file using GPUDirect.
 + * How it works:
@@ -1236,13 +1440,52 @@ index 0000000..6be547f
 + *    1.2. Copy from the RM mem to the backing file.
 +
 + * @param va_block: va_block to work with
-+ * @param page_mask: Transfer only the specified pages in this va_block
++ * @param page_mask: Transfer only the specified pages in this va_block. This is destructive.
 + *
 + * @return: NV_OK on success. NV_ERR_* otherwise.
 + */
-+NV_STATUS uvm_nvmgpu_direct_io_write(uvm_va_block_t *va_block, const uvm_page_mask_t *page_mask)
++NV_STATUS uvm_nvmgpu_direct_io_write(uvm_va_block_t *va_block, uvm_page_mask_t *page_mask)
 +{
-+    return NV_ERR_NOT_SUPPORTED;
++    NV_STATUS status = NV_OK;
++
++    uvm_processor_id_t src_id;
++    uvm_processor_mask_t search_mask;
++
++    // Nothing to copy.
++    if (uvm_page_mask_weight(page_mask) == 0)
++        return NV_OK;
++
++    // All GPUs associated with this va_block.
++    uvm_processor_mask_copy(&search_mask, &va_block->resident);
++    uvm_processor_mask_clear(&search_mask, UVM_ID_CPU);
++
++    for_each_closest_id(src_id, &search_mask, UVM_ID_CPU, va_block->va_range->va_space) 
++    {
++        uvm_page_mask_t *src_resident_mask = uvm_va_block_resident_mask_get(va_block, src_id);
++        uvm_page_mask_t src_copy_page_mask;
++
++        uvm_page_mask_and(&src_copy_page_mask, page_mask, src_resident_mask);
++
++        // No need to copy from this src.
++        if (uvm_page_mask_weight(&src_copy_page_mask) == 0)
++            continue;
++
++        // Do the actual copy
++        status = nvmgpu_direct_io_write_from_gpu(va_block, src_id, &src_copy_page_mask);
++        if (status != NV_OK)
++        {
++            printk(KERN_DEBUG "nvmgpu_direct_io_write_from_gpu error %s\n", nvstatusToString(status));
++            return status;
++        }
++
++        uvm_page_mask_andnot(page_mask, page_mask, &src_copy_page_mask);
++
++        // Nothing left to copy.
++        if (uvm_page_mask_weight(page_mask) == 0)
++            break;
++    }
++
++    return NV_OK;
 +}
 +
 +/**
@@ -1683,7 +1926,7 @@ index 0000000..6be547f
 +
 diff --git a/kernel/nvidia-uvm/uvm8_nvmgpu.h b/kernel/nvidia-uvm/uvm8_nvmgpu.h
 new file mode 100644
-index 0000000..786575d
+index 0000000..9b9e862
 --- /dev/null
 +++ b/kernel/nvidia-uvm/uvm8_nvmgpu.h
 @@ -0,0 +1,257 @@
@@ -1770,7 +2013,7 @@ index 0000000..786575d
 +NV_STATUS uvm_nvmgpu_write_end(uvm_va_block_t *va_block, bool is_flush);
 +
 +NV_STATUS uvm_nvmgpu_direct_io_read(uvm_va_block_t *va_block, uvm_gpu_id_t gpu_id, const uvm_page_mask_t *page_mask);
-+NV_STATUS uvm_nvmgpu_direct_io_write(uvm_va_block_t *va_block, const uvm_page_mask_t *page_mask);
++NV_STATUS uvm_nvmgpu_direct_io_write(uvm_va_block_t *va_block, uvm_page_mask_t *page_mask);
 +
 +NV_STATUS uvm_nvmgpu_reduce_memory_consumption(uvm_va_space_t *va_space);
 +
@@ -1945,7 +2188,7 @@ index 0000000..786575d
 +
 +#endif
 diff --git a/kernel/nvidia-uvm/uvm8_va_block.c b/kernel/nvidia-uvm/uvm8_va_block.c
-index 36a226d..24f7bc3 100644
+index 36a226d..78d54b8 100644
 --- a/kernel/nvidia-uvm/uvm8_va_block.c
 +++ b/kernel/nvidia-uvm/uvm8_va_block.c
 @@ -38,6 +38,7 @@
@@ -2032,7 +2275,7 @@ index 36a226d..24f7bc3 100644
      uvm_page_mask_t *resident_mask = uvm_va_block_resident_mask_get(block, dst_id);
      NvU32 missing_pages_count;
      NvU32 pages_copied;
-@@ -2835,20 +2851,40 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
+@@ -2835,20 +2851,43 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
                                       BLOCK_TRANSFER_MODE_INTERNAL_MOVE_TO_STAGE;
      }
  
@@ -2055,8 +2298,11 @@ index 36a226d..24f7bc3 100644
 +        && uvm_nvmgpu_need_to_evict_from_gpu(block)
 +        && (block->va_range->nvmgpu_va_range->flags & UVM_NVMGPU_FLAG_DIRECT)
 +    ) {
++        uvm_page_mask_t write_page_mask;
++        uvm_page_mask_copy(&write_page_mask, copy_page_mask);
++
 +        // For eviction with DIRECT IO, we skip host buffer all together.
-+        status = uvm_nvmgpu_direct_io_write(block, copy_page_mask);
++        status = uvm_nvmgpu_direct_io_write(block, &write_page_mask);
 +        if (status != NV_OK) {
 +            printk(KERN_DEBUG "uvm_nvmgpu_direct_io_write error %s\n", nvstatusToString(status));
 +            goto out;
@@ -2087,7 +2333,7 @@ index 36a226d..24f7bc3 100644
  
      // If destination is the CPU then we copied everything there above
      if (UVM_ID_IS_CPU(dst_id)) {
-@@ -2946,6 +2982,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -2946,6 +2985,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      uvm_page_mask_t *unmap_page_mask = &va_block_context->make_resident.page_mask;
      uvm_page_mask_t *resident_mask;
  
@@ -2100,7 +2346,7 @@ index 36a226d..24f7bc3 100644
      va_block_context->make_resident.dest_id = dest_id;
      va_block_context->make_resident.cause = cause;
  
-@@ -2959,6 +3001,25 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -2959,6 +3004,25 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      UVM_ASSERT(va_block->va_range);
      UVM_ASSERT(va_block->va_range->type == UVM_VA_RANGE_TYPE_MANAGED);
  
@@ -2126,7 +2372,7 @@ index 36a226d..24f7bc3 100644
      resident_mask = block_resident_mask_get_alloc(va_block, dest_id);
      if (!resident_mask)
          return NV_ERR_NO_MEMORY;
-@@ -2997,9 +3058,16 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -2997,9 +3061,16 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      // va_block_context->make_resident.page_mask.
      unmap_page_mask = NULL;
  
@@ -2146,7 +2392,7 @@ index 36a226d..24f7bc3 100644
  
      status = block_copy_resident_pages(va_block,
                                         va_block_context,
-@@ -3019,6 +3087,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -3019,6 +3090,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      // empty).
      if (uvm_processor_mask_test(&va_block->resident, dest_id))
          block_mark_memory_used(va_block, dest_id);
@@ -2159,7 +2405,7 @@ index 36a226d..24f7bc3 100644
  
      return NV_OK;
  }
-@@ -3866,9 +3940,10 @@ static void block_unmap_cpu(uvm_va_block_t *block, uvm_va_block_region_t region,
+@@ -3866,9 +3943,10 @@ static void block_unmap_cpu(uvm_va_block_t *block, uvm_va_block_region_t region,
          if (!block_has_valid_mapping_cpu(block, subregion))
              continue;
  
@@ -2173,7 +2419,7 @@ index 36a226d..24f7bc3 100644
  
          for (pte_bit = 0; pte_bit < UVM_PTE_BITS_CPU_MAX; pte_bit++)
              uvm_page_mask_region_clear(&block->cpu.pte_bits[pte_bit], subregion);
-@@ -7755,17 +7830,20 @@ static void block_kill(uvm_va_block_t *block)
+@@ -7755,17 +7833,20 @@ static void block_kill(uvm_va_block_t *block)
  
      // Free CPU pages
      if (block->cpu.pages) {
@@ -2204,7 +2450,7 @@ index 36a226d..24f7bc3 100644
          }
  
          // Clearing the resident bit isn't strictly necessary since this block
-@@ -9426,6 +9504,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9426,6 +9507,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
      uvm_perf_prefetch_hint_t prefetch_hint = UVM_PERF_PREFETCH_HINT_NONE();
      uvm_processor_mask_t processors_involved_in_cpu_migration;
  
@@ -2212,7 +2458,7 @@ index 36a226d..24f7bc3 100644
      uvm_assert_mutex_locked(&va_block->lock);
      UVM_ASSERT(va_range->type == UVM_VA_RANGE_TYPE_MANAGED);
  
-@@ -9525,6 +9604,28 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9525,6 +9607,28 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
              uvm_page_mask_andnot(&service_context->block_context.caller_page_mask,
                                   new_residency_mask,
                                   &service_context->read_duplicate_mask)) {
@@ -2241,7 +2487,7 @@ index 36a226d..24f7bc3 100644
              status = uvm_va_block_make_resident(va_block,
                                                  block_retry,
                                                  &service_context->block_context,
-@@ -9536,7 +9637,14 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9536,7 +9640,14 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                  prefetch_hint.prefetch_pages_mask,
                                                  cause);
              if (status != NV_OK)
@@ -2257,7 +2503,7 @@ index 36a226d..24f7bc3 100644
          }
  
          if (service_context->read_duplicate_count != 0 &&
-@@ -9552,7 +9660,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9552,7 +9663,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                                 prefetch_hint.prefetch_pages_mask,
                                                                 cause);
              if (status != NV_OK)
@@ -2266,7 +2512,7 @@ index 36a226d..24f7bc3 100644
          }
  
          if (UVM_ID_IS_CPU(new_residency)) {
-@@ -9657,7 +9765,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9657,7 +9768,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                         &service_context->revocation_mask,
                                                         revoke_prot);
                  if (status != NV_OK)
@@ -2275,7 +2521,7 @@ index 36a226d..24f7bc3 100644
              }
          }
      }
-@@ -9696,7 +9804,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9696,7 +9807,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                  status = NV_OK;
              }
              if (status != NV_OK)
@@ -2284,7 +2530,7 @@ index 36a226d..24f7bc3 100644
          }
      }
  
-@@ -9722,7 +9830,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9722,7 +9833,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                          map_prot_mask,
                                          NULL);
              if (status != NV_OK)
@@ -2293,7 +2539,7 @@ index 36a226d..24f7bc3 100644
          }
  
          // 3.2 - Add new mappings
-@@ -9747,7 +9855,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9747,7 +9858,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                            UvmEventMapRemoteCauseThrashing,
                                            &va_block->tracker);
                  if (status != NV_OK)
@@ -2302,7 +2548,7 @@ index 36a226d..24f7bc3 100644
  
                  // Remove thrashing pages from the map mask
                  pages_need_mapping = uvm_page_mask_andnot(helper_page_mask,
-@@ -9769,7 +9877,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9769,7 +9880,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                    UvmEventMapRemoteCausePolicy,
                                    &va_block->tracker);
          if (status != NV_OK)
@@ -2311,7 +2557,7 @@ index 36a226d..24f7bc3 100644
      }
  
      // 4- If pages did migrate, map SetAccessedBy processors, except for UVM-Lite
-@@ -9815,7 +9923,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9815,7 +9926,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                                         new_prot,
                                                                         map_thrashing_processors);
                      if (status != NV_OK)
@@ -2320,7 +2566,7 @@ index 36a226d..24f7bc3 100644
                  }
  
                  pages_need_mapping = uvm_page_mask_andnot(map_prot_mask,
-@@ -9835,11 +9943,23 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9835,11 +9946,23 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                                 new_prot,
                                                                 NULL);
              if (status != NV_OK)

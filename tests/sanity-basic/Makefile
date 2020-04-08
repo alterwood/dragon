@@ -1,4 +1,4 @@
-all: bin/write bin/read
+all: bin/write bin/read bin/write-direct bin/read-direct
 
 bin/write: write.cu
 	mkdir -p bin
@@ -7,6 +7,10 @@ bin/write: write.cu
 bin/read: read.cu
 	mkdir -p bin
 	nvcc -o bin/read read.cu -ldragon
+
+bin/write-direct: write-direct.cu
+	mkdir -p bin
+	nvcc -o bin/write-direct write-direct.cu -ldragon
 
 bin/read-direct: read-direct.cu
 	mkdir -p bin

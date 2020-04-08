@@ -193,9 +193,9 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
 
     if (flags & D_F_DIRECT)
     {
-        if (flags & ~(D_F_READ | D_F_DIRECT | D_F_CREATE))
+        if (flags & ~(D_F_READ | D_F_WRITE | D_F_DIRECT | D_F_CREATE))
         {
-            fprintf(stderr, "D_F_DIRECT is not compatible with other flags except D_F_READ\n");
+            fprintf(stderr, "D_F_DIRECT can be used with D_F_READ, D_F_WRITE, and/or D_F_CREATE only\n");
             ret = D_ERR_INTVAL;
             goto _out_err_2;
         }
@@ -216,10 +216,6 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
         goto _out_err_3;
     }
 
-    request->uvm_addr = (uint64_t)uvm_buf;
-    request->flags = flags;
-    request->size = size;
-
     if ((flags & D_F_READ) && !(flags & D_F_VOLATILE))
     {
         if ((status = posix_fadvise(request->backing_fd, 0, 0, fadvice)) != 0)
@@ -227,6 +223,12 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
         if ((fadvice == POSIX_FADV_SEQUENTIAL) && readahead(request->backing_fd, 0, size) != 0)
             fprintf(stderr, "readahead error.\n");
     }
+
+    flags = flags & ~D_F_CREATE;
+
+    request->uvm_addr = (uint64_t)uvm_buf;
+    request->flags = flags;
+    request->size = size;
 
     if ((status = ioctl(nvidia_uvm_fd, DRAGON_IOCTL_MAP, request)) != 0)
     {
