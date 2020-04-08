@@ -88,8 +88,8 @@ We add one more flag called *D_F_DIRECT*. Look at
 
 ## Current limitations
 
-1. *D_F_DIRECT* works with *D_F_READ* only. We plan to add support for other
-combinations of flags later.
+1. *D_F_DIRECT* works with *D_F_READ* and *D_F_WRITE* only. We plan to add
+support for other combinations of flags later.
 
 2. Your file needs to be on that NVMe device. It may lead to kernel panic if you
 put the file elsewhere. Currently, there is no checking for the location of your
