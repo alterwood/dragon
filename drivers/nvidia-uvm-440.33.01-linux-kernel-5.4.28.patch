@@ -70,15 +70,17 @@ index 09a2562..0ec8968 100644
 +
  #endif // __UVM8_API_H__
 diff --git a/kernel/nvidia-uvm/uvm8_forward_decl.h b/kernel/nvidia-uvm/uvm8_forward_decl.h
-index e873a0a..ff9e441 100644
+index e873a0a..4dc231b 100644
 --- a/kernel/nvidia-uvm/uvm8_forward_decl.h
 +++ b/kernel/nvidia-uvm/uvm8_forward_decl.h
-@@ -89,4 +89,7 @@ typedef struct uvm_pmm_sysmem_mappings_struct uvm_pmm_sysmem_mappings_t;
+@@ -89,4 +89,9 @@ typedef struct uvm_pmm_sysmem_mappings_struct uvm_pmm_sysmem_mappings_t;
  
  typedef struct uvm_reverse_map_struct uvm_reverse_map_t;
  
 +typedef struct uvm_nvmgpu_va_space_struct uvm_nvmgpu_va_space_t;
 +typedef struct uvm_nvmgpu_va_range_struct uvm_nvmgpu_va_range_t;
++typedef struct uvm_nvmgpu_gdirect_buffer_struct uvm_nvmgpu_gdirect_buffer_t;
++typedef enum uvm_nvmgpu_gdirect_buffer_status_enum uvm_nvmgpu_gdirect_buffer_status_t;
 +
  #endif //__UVM8_FORWARD_DECL_H__
 diff --git a/kernel/nvidia-uvm/uvm8_gpu.c b/kernel/nvidia-uvm/uvm8_gpu.c
@@ -114,10 +116,10 @@ index fad4ac3..4addb83 100644
          uvm_va_space_up_read(va_space);
 diff --git a/kernel/nvidia-uvm/uvm8_nvmgpu.c b/kernel/nvidia-uvm/uvm8_nvmgpu.c
 new file mode 100644
-index 0000000..537fd0e
+index 0000000..3fafb25
 --- /dev/null
 +++ b/kernel/nvidia-uvm/uvm8_nvmgpu.c
-@@ -0,0 +1,1806 @@
+@@ -0,0 +1,2226 @@
 +#include <linux/syscalls.h>
 +#include <linux/delay.h>
 +#include <linux/aio.h>
@@ -128,6 +130,7 @@ index 0000000..537fd0e
 +#include <linux/sched/xacct.h>
 +#include <linux/backing-dev.h>
 +#include <linux/pci-p2pdma.h>
++#include <linux/genalloc.h>
 +
 +#include "nv_uvm_interface.h"
 +#include "uvm8_api.h"
@@ -162,6 +165,13 @@ index 0000000..537fd0e
 +
 +static void *fsdata_array[PAGES_PER_UVM_VA_BLOCK];
 +
++// Copied from drivers/pci/p2pdma.c
++struct pci_p2pdma {
++	struct gen_pool *pool;
++	bool p2pmem_published;
++	struct xarray map_types;
++};
++
 +// -----------------------------------------------------------------------------------------------------
 +// API
 +// -----------------------------------------------------------------------------------------------------
@@ -169,12 +179,7 @@ index 0000000..537fd0e
 +NV_STATUS uvm_api_nvmgpu_initialize(UVM_NVMGPU_INITIALIZE_PARAMS *params, struct file *filp)
 +{
 +    uvm_va_space_t *va_space = uvm_va_space_get(filp);
-+    return uvm_nvmgpu_initialize(
-+        va_space, 
-+        params->trash_nr_blocks,
-+        params->trash_reserved_nr_pages,
-+        params->flags
-+    );
++    return uvm_nvmgpu_initialize(va_space, params);
 +}
 +
 +NV_STATUS uvm_api_nvmgpu_register_file_va_space(UVM_NVMGPU_REGISTER_FILE_VA_SPACE_PARAMS *params, struct file *filp)
@@ -191,33 +196,82 @@ index 0000000..537fd0e
 +
 +// -----------------------------------------------------------------------------------------------------
 +
-+static NV_STATUS uvm_nvmgpu_gpu_direct_initialize(uvm_nvmgpu_gpu_direct_t *gpu_direct, uvm_gpu_t *gpu)
++static NV_STATUS nvmgpu_gdirect_unregister_pfn(uvm_gpu_t *gpu, unsigned long pfn)
++{
++    struct pci_dev *pdev = gpu->pci_dev;
++
++    struct dev_pagemap *pgmap = NULL;
++
++    pgmap = get_dev_pagemap(pfn, NULL);
++    // This PFN has not been registered. So exit.
++    if (!pgmap)
++        return NV_OK;
++
++    put_dev_pagemap(pgmap);
++
++    // Pool has been created. Remove it and replace with a new one.
++    if (pdev->p2pdma && pdev->p2pdma->pool)
++    {
++        gen_pool_destroy(pdev->p2pdma->pool);
++        pdev->p2pdma->pool = gen_pool_create(PAGE_SHIFT, dev_to_node(&pdev->dev));
++        if (!pdev->p2pdma->pool)
++        {
++            printk(KERN_DEBUG "Cannot allocate p2pdma->pool\n");
++            return NV_ERR_NO_MEMORY;
++        }
++    }
++
++    devm_memunmap_pages(&pdev->dev, pgmap);
++    devm_kfree(&pdev->dev, pgmap);
++
++    return NV_OK;
++}
++
++static NV_STATUS uvm_nvmgpu_gdirect_initialize(uvm_nvmgpu_gdirect_t *gdirect, uvm_gpu_t *gpu, unsigned int num_groups)
 +{
 +    NV_STATUS ret = NV_OK;
 +
 +    int i;
 +
 +    uvm_rm_mem_t *rm_mem = NULL;
++
 +    void *cpu_va = NULL;
 +    NvU64 gpu_va = 0;
 +    NvU64 aligned_gpu_va = 0;
++
 +    unsigned long original_pfn = 0;
 +    unsigned long pfn = 0;
++
 +    u64 bar1_offset = 0;
++
 +    struct dev_pagemap *conflict_pgmap = NULL;
 +    struct pci_dev *pdev_client = NULL;
++
 +    void *p2pmem_va = NULL;
++
 +    struct bio_vec *bvecs = NULL;
 +
-+    // Size has to be divisible by SUBSECTION's size.
-+    size_t p2pmem_size = (UVM_NVMGPU_GPU_DIRECT_BUF_SIZE + (PAGES_PER_SUBSECTION << PAGE_SHIFT) - 1) & ~((size_t)((PAGES_PER_SUBSECTION << PAGE_SHIFT) - 1));
++    size_t p2pmem_size;
++    unsigned int p2pmem_num_pages;
++    size_t rm_mem_alloc_size;
 +
-+    unsigned int p2pmem_num_pages = p2pmem_size / PAGE_SIZE;
++    unsigned int num_pages_per_group;
++    uvm_nvmgpu_gdirect_buffer_t *buffers = NULL;
++
++    gdirect->p2pmem_support = false;
++
++    UVM_ASSERT(num_groups > 0);
++
++    // Size has to be divisible by SUBSECTION's size.
++    p2pmem_size = (UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_SIZE * num_groups + (PAGES_PER_SUBSECTION << PAGE_SHIFT) - 1) & ~((size_t)((PAGES_PER_SUBSECTION << PAGE_SHIFT) - 1));
++
++    p2pmem_num_pages = p2pmem_size / PAGE_SIZE;
++    num_pages_per_group = p2pmem_num_pages / num_groups;
++
++    UVM_ASSERT(num_pages_per_group >= PAGES_PER_UVM_VA_BLOCK);
 +
 +    // We need to align PFN later, so allocate more memory for alignment.
-+    size_t rm_mem_alloc_size = p2pmem_size + (PAGES_PER_SUBSECTION << PAGE_SHIFT) - 1;
-+
-+    gpu_direct->p2pmem_support = false;
++    rm_mem_alloc_size = p2pmem_size + (PAGES_PER_SUBSECTION << PAGE_SHIFT) - 1;
 +
 +    // Allocate rm_mem on GPU to be used as GPUDirect buffer.
 +    ret = uvm_rm_mem_alloc_and_map_cpu(gpu, UVM_RM_MEM_TYPE_GPU, rm_mem_alloc_size, &rm_mem);
@@ -234,28 +288,26 @@ index 0000000..537fd0e
 +    // P2PDMA requires alignment, so do it.
 +    pfn = SUBSECTION_ALIGN_UP(original_pfn);
 +
++    // Calculate the offset w.r.t. the GPU BAR1 start address.
++    bar1_offset = PFN_PHYS(pfn) - pci_resource_start(gpu->pci_dev, 1);
++
 +    // Record aligned GPU VA.
 +    gpu_va = uvm_rm_mem_get_gpu_va(rm_mem, gpu);
 +    aligned_gpu_va = gpu_va + ((pfn - original_pfn) << PAGE_SHIFT);
 +
-+    // Calculate the offset w.r.t. the GPU BAR1 start address.
-+    bar1_offset = PFN_PHYS(pfn) - pci_resource_start(gpu->pci_dev, 1);
-+
++    // If this PFN has already been registered. Try to unregister it.
 +    conflict_pgmap = get_dev_pagemap(pfn, NULL);
-+    if (!conflict_pgmap) 
++    if (conflict_pgmap)
 +    {
-+        // This pfn has never been registered with P2PMEM so do it.
-+        gpu_direct->p2pmem_support = (pci_p2pdma_add_resource(gpu->pci_dev, 1, p2pmem_size, bar1_offset) == 0);
-+    }
-+    else
-+    {
-+        // This pfn has already been registered, ignore.
 +        put_dev_pagemap(conflict_pgmap);
-+        gpu_direct->p2pmem_support = true;
++        nvmgpu_gdirect_unregister_pfn(gpu, pfn);
 +    }
++
++    // Register this PFN with P2PMEM.
++    gdirect->p2pmem_support = (pci_p2pdma_add_resource(gpu->pci_dev, 1, p2pmem_size, bar1_offset) == 0);
 +
 +    // P2PMEM is not supported. Revert the operations.
-+    if (!gpu_direct->p2pmem_support)
++    if (!gdirect->p2pmem_support)
 +    {
 +        ret = NV_ERR_NOT_SUPPORTED;
 +        printk(KERN_DEBUG "p2pmem is not supported\n");
@@ -275,7 +327,7 @@ index 0000000..537fd0e
 +    if (!bvecs)
 +    {
 +        ret = NV_ERR_NO_MEMORY;
-+        printk(KERN_DEBUG "error in uvm_kvmalloc_zero\n");
++        printk(KERN_DEBUG "error in uvm_kvmalloc\n");
 +        goto err;
 +    }
 +
@@ -295,45 +347,115 @@ index 0000000..537fd0e
 +        bvecs[i].bv_offset = 0;
 +    }
 +
-+    gpu_direct->gpu = gpu;
-+    gpu_direct->rm_mem = rm_mem;
-+    gpu_direct->aligned_rm_gpu_va = aligned_gpu_va;
-+    gpu_direct->p2pmem_va = p2pmem_va;
-+    gpu_direct->p2pmem_size = p2pmem_size;
-+    gpu_direct->p2pmem_num_pages = p2pmem_num_pages;
-+    gpu_direct->bvecs = bvecs;
++    buffers = uvm_kvmalloc_zero(sizeof(uvm_nvmgpu_gdirect_buffer_t) * num_groups);
++    if (!buffers)
++    {
++        ret = NV_ERR_NO_MEMORY;
++        printk(KERN_DEBUG "error in uvm_kvmalloc_zero when allocating buffers\n");
++        goto err;
++    }
++
++    for (i = 0; i < num_groups; ++i)
++    {
++        buffers[i].bvecs = &bvecs[i * num_pages_per_group];
++        buffers[i].aligned_rm_gpu_va = aligned_gpu_va + i * num_pages_per_group * PAGE_SIZE;
++        buffers[i].gdirect = gdirect;
++    }
++
++    gdirect->gpu = gpu;
++
++    gdirect->rm_mem = rm_mem;
++    gdirect->aligned_rm_gpu_va = aligned_gpu_va;
++
++    gdirect->p2pmem_pfn = pfn;
++    gdirect->p2pmem_va = p2pmem_va;
++    gdirect->p2pmem_size = p2pmem_size;
++    gdirect->p2pmem_num_pages = p2pmem_num_pages;
++
++    gdirect->bvecs = bvecs;
++
++    gdirect->num_buffer_groups = num_groups;
++    gdirect->buffers = buffers;
++
++    INIT_LIST_HEAD(&gdirect->buffer_reuse_head);
++    for (i = 1; i < num_groups; ++i)
++    {
++        // Putting most of the buffers in reuse pool. They will be used for readahead.
++        list_add_tail(&buffers[i].reuse_lh, &gdirect->buffer_reuse_head);
++        buffers[i].is_in_reuse_pool = true;
++    }
++    gdirect->buffer_reuse_count = num_groups - 1;
++
++    // We reserve the first buffer to be used in immediate transfer.
++    buffers[0].is_reserved = true;
++
++    uvm_mutex_init(&gdirect->buffer_lock, UVM_LOCK_ORDER_VA_SPACE);
 +    
 +    return NV_OK;
 +
 +err:
 +    pci_p2pmem_publish(gpu->pci_dev, false);
 +
-+    if (p2pmem_va)
-+        pci_free_p2pmem(gpu->pci_dev, p2pmem_va, p2pmem_size);
++    if (buffers)
++        uvm_kvfree(buffers);
 +
 +    if (bvecs)
 +        uvm_kvfree(bvecs);
 +
++    if (p2pmem_va)
++        pci_free_p2pmem(gpu->pci_dev, p2pmem_va, p2pmem_size);
++
++    if (pfn)
++    {
++        pci_p2pmem_publish(gpu->pci_dev, false);
++        nvmgpu_gdirect_unregister_pfn(gpu, pfn);
++    }
++
 +    if (rm_mem)
 +        uvm_rm_mem_free(rm_mem);
 +    
-+    gpu_direct->p2pmem_support = false;
++    gdirect->p2pmem_support = false;
 +
 +    return ret;
 +}
 +
-+static void uvm_nvmgpu_gpu_direct_deinitialize(uvm_nvmgpu_gpu_direct_t *gpu_direct)
++static void uvm_nvmgpu_gdirect_deinitialize(uvm_nvmgpu_gdirect_t *gdirect)
 +{
-+    pci_p2pmem_publish(gpu_direct->gpu->pci_dev, false);
++    int i;
 +
-+    if (gpu_direct->bvecs)
-+        uvm_kvfree(gpu_direct->bvecs);
++    if (gdirect->p2pmem_support)
++    {
++        if (gdirect->buffers)
++        {
++            // Wait until all async reads finish.
++            while (atomic_read(&gdirect->num_async_reading) > 0)
++                cond_resched();
 +
-+    if (gpu_direct->p2pmem_va)
-+        pci_free_p2pmem(gpu_direct->gpu->pci_dev, gpu_direct->p2pmem_va, gpu_direct->p2pmem_size);
++            for (i = 0; i < gdirect->num_buffer_groups; ++i)
++            {
++                uvm_nvmgpu_gdirect_buffer_t *buffer = &gdirect->buffers[i];
++                if (buffer->va_block)
++                    buffer->va_block->nvmgpu.gdirect_buffer = NULL;
++            }
++            uvm_kvfree(gdirect->buffers);
++        }
 +
-+    if (gpu_direct->rm_mem)
-+        uvm_rm_mem_free(gpu_direct->rm_mem);
++        if (gdirect->bvecs)
++            uvm_kvfree(gdirect->bvecs);
++
++        if (gdirect->p2pmem_va)
++        {
++            pci_p2pmem_publish(gdirect->gpu->pci_dev, false);
++            pci_free_p2pmem(gdirect->gpu->pci_dev, gdirect->p2pmem_va, gdirect->p2pmem_size);
++        }
++
++        if (gdirect->p2pmem_pfn)
++            nvmgpu_gdirect_unregister_pfn(gdirect->gpu, gdirect->p2pmem_pfn);
++
++        if (gdirect->rm_mem)
++            uvm_rm_mem_free(gdirect->rm_mem);
++    }
++    gdirect->p2pmem_support = false;
 +}
 +
 +/**
@@ -342,27 +464,22 @@ index 0000000..537fd0e
 + * "uvm_nvmgpu_register_file_va_space"
 + *
 + * @param va_space: va_space to be initialized this module with.
-+ *
-+ * @param trash_nr_blocks: maximum number of va_block NVMGPU should evict out
-+ * at one time.
-+ *
-+ * @param trash_reserved_nr_pages: NVMGPU will automatically evicts va_block
-+ * when number of free pages plus number of page-cache pages less than this
-+ * value.
-+ *
-+ * @param flags: the flags that dictate the optimization behaviors. See
-+ * UVM_NVMGPU_INIT_* for more details.
++ * @param params: initialization parameters.
 + *
 + * @return: NV_ERR_INVALID_OPERATION if `va_space` has been initialized already,
 + * otherwise NV_OK.
 + */
-+NV_STATUS uvm_nvmgpu_initialize(uvm_va_space_t *va_space, unsigned long trash_nr_blocks, unsigned long trash_reserved_nr_pages, unsigned short flags)
++NV_STATUS uvm_nvmgpu_initialize(uvm_va_space_t *va_space, UVM_NVMGPU_INITIALIZE_PARAMS *params)
 +{
 +    uvm_nvmgpu_va_space_t *nvmgpu_va_space = NULL;
 +
 +    uvm_gpu_id_t gpu_id;
 +    uvm_gpu_t *gpu;
-+    uvm_nvmgpu_gpu_direct_t *gpu_direct;
++
++    uvm_nvmgpu_gdirect_t *gdirect;
++    unsigned int gdirect_num_groups = params->gdirect_num_groups;
++
++    bool gdirect_support = false;
 +
 +    if (!uvm_nvmgpu_is_va_space_initialized(va_space))
 +    {
@@ -372,17 +489,28 @@ index 0000000..537fd0e
 +
 +        INIT_LIST_HEAD(&nvmgpu_va_space->lru_head);
 +        uvm_mutex_init(&nvmgpu_va_space->lock, UVM_LOCK_ORDER_VA_SPACE);
-+        nvmgpu_va_space->trash_nr_blocks = trash_nr_blocks;
-+        nvmgpu_va_space->trash_reserved_nr_pages = trash_reserved_nr_pages;
-+        nvmgpu_va_space->flags = flags;
++        nvmgpu_va_space->trash_nr_blocks = params->trash_nr_blocks;
++        nvmgpu_va_space->trash_reserved_nr_pages = params->trash_reserved_nr_pages;
++        nvmgpu_va_space->flags = params->flags;
 +
-+        for_each_gpu_id_in_mask(gpu_id, &va_space->registered_gpus)
++        if (gdirect_num_groups > 0)
 +        {
-+            gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu_id)];
-+            gpu = uvm_va_space_get_gpu(va_space, gpu_id);
-+            
-+            uvm_nvmgpu_gpu_direct_initialize(gpu_direct, gpu);
++            for_each_gpu_id_in_mask(gpu_id, &va_space->registered_gpus)
++            {
++                gdirect = &nvmgpu_va_space->gdirect_table[uvm_id_gpu_index(gpu_id)];
++                gpu = uvm_va_space_get_gpu(va_space, gpu_id);
++                
++                if (uvm_nvmgpu_gdirect_initialize(gdirect, gpu, gdirect_num_groups) != NV_OK)
++                {
++                    gdirect_support = false;
++                    break;
++                }
++                gdirect_support = true;
++            }
 +        }
++
++        printk(KERN_DEBUG "nvmgpu: GPUDirect support=%s\n", gdirect_support ? "yes" : "no");
++        nvmgpu_va_space->gdirect_support = gdirect_support;
 +
 +        nvmgpu_va_space->is_initailized = true;
 +
@@ -404,12 +532,26 @@ index 0000000..537fd0e
 +    if (va_space->nvmgpu_va_space)
 +    {
 +        uvm_gpu_id_t gpu_id;
-+        uvm_nvmgpu_gpu_direct_t *gpu_direct;
++        uvm_nvmgpu_gdirect_t *gdirect;
++
++        #if UVM_NVMGPU_PROFILING
++        uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
++
++        printk(KERN_DEBUG "uvm_nvmgpu: profiling: header: dio_read_file(ns),dio_read_memcopy(ns),pc_read_file(ns),pc_read_memcopy(ns),populate_gpu_pages(ns)\n");
++        printk(
++            KERN_DEBUG "uvm_nvmgpu: profiling: data: %llu,%llu,%llu,%llu,%llu\n", 
++            nvmgpu_va_space->time.dio_read_file,
++            nvmgpu_va_space->time.dio_read_memcopy,
++            nvmgpu_va_space->time.pc_read_file,
++            nvmgpu_va_space->time.pc_read_memcopy,
++            nvmgpu_va_space->time.populate_gpu_pages
++        );
++        #endif
 +
 +        for_each_gpu_id_in_mask(gpu_id, &va_space->registered_gpus)
 +        {
-+            gpu_direct = &va_space->nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu_id)];
-+            uvm_nvmgpu_gpu_direct_deinitialize(gpu_direct);
++            gdirect = &va_space->nvmgpu_va_space->gdirect_table[uvm_id_gpu_index(gpu_id)];
++            uvm_nvmgpu_gdirect_deinitialize(gdirect);
 +        }
 +
 +        uvm_kvfree(va_space->nvmgpu_va_space);
@@ -432,9 +574,6 @@ index 0000000..537fd0e
 +    NV_STATUS ret = NV_OK;
 +    uvm_nvmgpu_va_range_t *nvmgpu_va_range = NULL;
 +    uvm_nvmgpu_va_space_t *nvmgpu_va_space;
-+
-+    uvm_gpu_id_t gpu_id;
-+    uvm_nvmgpu_gpu_direct_t *gpu_direct;
 +
 +    uvm_va_range_t *va_range = uvm_va_range_find(va_space, params->uvm_addr);
 +    NvU64 expected_start_addr = params->uvm_addr;
@@ -472,15 +611,11 @@ index 0000000..537fd0e
 +            goto error;
 +        }
 +
-+        for_each_gpu_id_in_mask(gpu_id, &va_space->registered_gpus)
++        if (!nvmgpu_va_space->gdirect_support)
 +        {
-+            gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu_id)];
-+            if (!gpu_direct->p2pmem_support)
-+            {
-+                printk(KERN_DEBUG "GPU %d does not support P2PMEM\n", uvm_id_value(gpu_id));
-+                ret = NV_ERR_NOT_SUPPORTED;
-+                goto error;
-+            }
++            printk(KERN_DEBUG "GPUDirect is not supported.\n");
++            ret = NV_ERR_NOT_SUPPORTED;
++            goto error;
 +        }
 +    }
 +
@@ -583,7 +718,7 @@ index 0000000..537fd0e
 +        uvm_nvmgpu_block_clear_file_dirty(va_block);
 +        if (nvmgpu_va_range->flags & UVM_NVMGPU_FLAG_VOLATILE) {
 +            uvm_nvmgpu_release_block(va_block);
-+            list_del(&va_block->nvmgpu_lru);
++            list_del(&va_block->nvmgpu.lru);
 +        }
 +    }
 +
@@ -955,6 +1090,12 @@ index 0000000..537fd0e
 +
 +    uvm_nvmgpu_va_range_t *nvmgpu_va_range = va_range->nvmgpu_va_range;
 +
++    #if UVM_NVMGPU_PROFILING
++    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_range->va_space->nvmgpu_va_space;
++
++    struct timespec tv_start, tv_end;
++    #endif
++
 +    struct file *nvmgpu_file = nvmgpu_va_range->filp;
 +
 +    // Calculate the file offset based on the block start address.
@@ -964,7 +1105,7 @@ index 0000000..537fd0e
 +    int page_id; 
 +
 +    // Specify that the entire block is the region of concern.
-+    uvm_va_block_region_t region = uvm_va_block_region(0, (va_block->end - va_block->start + 1) / PAGE_SIZE);
++    uvm_va_block_region_t region = uvm_va_block_region_from_block(va_block);
 +
 +    uvm_page_mask_t read_mask;
 +
@@ -982,7 +1123,7 @@ index 0000000..537fd0e
 +        // Prevent block_populate_pages from allocating new pages
 +        uvm_nvmgpu_block_set_file_dirty(va_block);
 +
-+        // Change this va_block's state: all pages are the residents of CPU.
++        // Change this va_block's state: all pages are the resident of CPU.
 +        status = uvm_va_block_make_resident(va_block,
 +                                            block_retry,
 +                                            &service_context->block_context,
@@ -1010,6 +1151,10 @@ index 0000000..537fd0e
 +
 +    uvm_page_mask_fill(&read_mask);
 +
++    #if UVM_NVMGPU_PROFILING
++    getnstimeofday(&tv_start);
++    #endif
++
 +    // Fill in page-cache pages to va_block
 +    for_each_va_block_page_in_region_mask(page_id, &read_mask, region) {
 +        offset = file_start_offset + page_id * PAGE_SIZE;
@@ -1022,6 +1167,12 @@ index 0000000..537fd0e
 +
 +        UVM_ASSERT(va_block->cpu.pages[page_id]);
 +    }
++
++    #if UVM_NVMGPU_PROFILING
++    getnstimeofday(&tv_end);
++
++    nvmgpu_va_space->time.pc_read_file += uvm_nvmgpu_timediff(tv_start, tv_end);
++    #endif
 +
 +    uvm_nvmgpu_block_set_has_data(va_block);
 +
@@ -1038,10 +1189,9 @@ index 0000000..537fd0e
 +    struct page *page;
 +
 +    uvm_page_mask_t read_mask;
-+    uvm_va_block_region_t region = uvm_va_block_region(0, (va_block->end - va_block->start + 1) / PAGE_SIZE);
 +
 +    uvm_page_mask_fill(&read_mask);
-+    for_each_va_block_page_in_region_mask(page_id, &read_mask, region) {
++    for_each_va_block_page_in_mask(page_id, &read_mask, va_block) {
 +        page = va_block->cpu.pages[page_id];
 +        if (page) {
 +            unlock_page(page);
@@ -1052,51 +1202,253 @@ index 0000000..537fd0e
 +    return NV_OK;
 +}
 +
-+static NV_STATUS nvmgpu_direct_io_read_range(
++/**
++ * Return the buffer to the reuse pool. gdirect->buffer_lock must be held before calling this function.
++ */
++static inline void nvmgpu_gdirect_return_buffer_to_pool_locked(uvm_nvmgpu_gdirect_buffer_t *buffer)
++{
++    uvm_nvmgpu_gdirect_t *gdirect = buffer->gdirect;
++
++    if (unlikely(buffer->is_reserved || buffer->is_in_reuse_pool))
++        return;
++
++    if (unlikely(UVM_READ_ONCE(buffer->status) == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_NONE))
++        list_add(&buffer->reuse_lh, &gdirect->buffer_reuse_head);
++    else
++        list_add_tail(&buffer->reuse_lh, &gdirect->buffer_reuse_head);
++
++    buffer->is_in_reuse_pool = true;
++    ++gdirect->buffer_reuse_count;
++}
++
++/**
++ * Return the buffer to the reuse pool. This function will hold (then release) gdirect->buffer_lock.
++ */
++static inline void nvmgpu_gdirect_return_buffer_to_pool(uvm_nvmgpu_gdirect_buffer_t *buffer)
++{
++    uvm_nvmgpu_gdirect_t *gdirect = buffer->gdirect;
++
++    uvm_mutex_lock(&gdirect->buffer_lock);
++    nvmgpu_gdirect_return_buffer_to_pool_locked(buffer);
++    uvm_mutex_unlock(&gdirect->buffer_lock);
++}
++
++/**
++ * Callback when doing async GPUDirect read.
++ */
++static void nvmgpu_gdirect_ki_complete(struct kiocb *kiocb, long ret, long ret2)
++{
++    uvm_nvmgpu_gdirect_buffer_t *buffer = container_of(kiocb, uvm_nvmgpu_gdirect_buffer_t, kiocb);
++
++    uvm_nvmgpu_gdirect_t *gdirect = buffer->gdirect;
++
++    if (likely(ret == buffer->read_size))
++        UVM_WRITE_ONCE(buffer->status, UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READY);
++    else if (buffer->status == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READING)
++    {
++        UVM_WRITE_ONCE(buffer->status, UVM_NVMGPU_GDIRECT_BUFFER_STATUS_NONE);
++        buffer->read_size = 0;
++        if (!buffer->is_reserved)
++            nvmgpu_gdirect_return_buffer_to_pool(buffer);
++    }
++
++    atomic_dec(&gdirect->num_async_reading);
++}
++
++/**
++ * Prepare read buffer for this va_block.
++ *
++ * @param va_block: the va_block for preparing read buffer.
++ * @param gdirect: GPUDirect object.
++ * @param use_sync_io: true to use synchronous read; false to use asynchronous read.
++ * @param wait_ready: wait until the buffer is ready (the file read finishes).
++ *
++ * @return: NV_OK if success; NV_ERR_* otherwise.
++ *
++ */
++static NV_STATUS nvmgpu_gdirect_prepare_va_block_read(uvm_va_block_t *va_block, uvm_nvmgpu_gdirect_t *gdirect, bool use_sync_io, bool wait_ready)
++{
++    uvm_va_range_t *va_range = va_block->va_range;
++    uvm_nvmgpu_va_range_t *nvmgpu_va_range = va_range->nvmgpu_va_range;
++
++    uvm_nvmgpu_gdirect_buffer_t *buffer = NULL;
++
++    struct file *filp = nvmgpu_va_range->filp;
++    size_t file_size = i_size_read(filp->f_mapping->host);
++
++    struct iov_iter iter;
++    ssize_t retcode;
++
++    // Calculate the file offset and read size.
++    loff_t f_offset = va_block->start - va_range->node.start;
++    size_t read_size = MIN(uvm_va_block_size(va_block), file_size - f_offset);
++
++    buffer = va_block->nvmgpu.gdirect_buffer;
++    if (buffer)
++    {
++        // If requested, wait until the async reading is completed.
++        while (wait_ready && (UVM_READ_ONCE(buffer->status) == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READING))
++            ;
++        
++        // Buffer is ready. Nothing to do.
++        if (UVM_READ_ONCE(buffer->status) == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READY)
++            return NV_OK;
++
++        // Async reading might failed. Fall through in that case.
++    }
++
++    uvm_mutex_lock(&gdirect->buffer_lock);
++
++    // Find a buffer if this va_block does not have one.
++    if (!buffer)
++    {
++        // For immediate read or we don't have reusable buffer, we use the reserved buffer.
++        if (wait_ready || gdirect->buffer_reuse_count == 0)
++            buffer = &gdirect->buffers[0];
++        else
++            // Get a buffer from the pool.
++            buffer = list_first_entry(&gdirect->buffer_reuse_head, uvm_nvmgpu_gdirect_buffer_t, reuse_lh);
++    }
++
++    if (buffer->is_in_reuse_pool)
++    {
++        list_del(&buffer->reuse_lh);
++        buffer->is_in_reuse_pool = false;
++        if (buffer->va_block)
++            buffer->va_block->nvmgpu.gdirect_buffer = NULL;
++        --gdirect->buffer_reuse_count;
++    }
++
++    UVM_WRITE_ONCE(buffer->status, UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READING);
++
++    uvm_mutex_unlock(&gdirect->buffer_lock);
++
++    buffer->read_size = read_size;
++    va_block->nvmgpu.gdirect_buffer = buffer;
++
++    if (unlikely(read_size == 0))
++    {
++        UVM_WRITE_ONCE(buffer->status, UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READY);
++        return NV_OK;
++    }
++
++    // Prepare descriptor for read.
++    iov_iter_bvec(&iter, READ, buffer->bvecs, PAGES_PER_UVM_VA_BLOCK, read_size);
++
++    init_sync_kiocb(&buffer->kiocb, filp);
++    buffer->kiocb.ki_pos = f_offset;
++
++    if (!use_sync_io)
++    {
++        buffer->kiocb.ki_complete = nvmgpu_gdirect_ki_complete;
++        atomic_inc(&gdirect->num_async_reading);
++    }
++
++    // Submit read request to IO.
++    retcode = call_read_iter(filp, &buffer->kiocb, &iter);
++
++    // Encounter an IO error. Return the buffer to the pool.
++    if (unlikely((use_sync_io && retcode != read_size) || (!use_sync_io && retcode != -EIOCBQUEUED)))
++    {
++        UVM_WRITE_ONCE(buffer->status, UVM_NVMGPU_GDIRECT_BUFFER_STATUS_NONE);
++        buffer->read_size = 0;
++        if (!buffer->is_reserved)
++            nvmgpu_gdirect_return_buffer_to_pool(buffer);
++
++        if (!use_sync_io)
++            atomic_dec(&gdirect->num_async_reading);
++        return NV_ERR_OPERATING_SYSTEM;
++    }
++    else if (use_sync_io)
++        UVM_WRITE_ONCE(buffer->status, UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READY);
++
++    // If requested, wait until the async reading is completed.
++    while (wait_ready && (UVM_READ_ONCE(buffer->status) == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READING))
++        ;
++
++    if (UVM_READ_ONCE(buffer->status) == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_NONE)
++        return NV_ERR_OPERATING_SYSTEM;
++
++    return NV_OK;
++}
++
++static inline bool nvmgpu_gdirect_is_readahead_enabled(uvm_nvmgpu_gdirect_t *gdirect)
++{
++    return gdirect->num_buffer_groups > 1;
++}
++
++/**
++ * Readahead starting from the specified va_range addr. Readahead is heuristic.
++ *
++ */
++static void nvmgpu_gdirect_readahead(uvm_va_range_t *va_range, uvm_nvmgpu_gdirect_t *gdirect, NvU64 addr)
++{
++    NV_STATUS status;
++
++    size_t block_idx;
++    size_t num_blocks = uvm_va_range_num_blocks(va_range);
++    uvm_va_block_t *va_block;
++
++    const unsigned int ra_threshold = (gdirect->num_buffer_groups - 1) / 2;
++    unsigned int cnt = 0;
++
++    // Readahead is disabled.
++    if (unlikely(!nvmgpu_gdirect_is_readahead_enabled(gdirect)))
++        return;
++    
++    // No va_block at that addr.
++    if (addr > va_range->node.end)
++        return;
++
++    // Don't have enough buffer.
++    if (UVM_READ_ONCE(gdirect->buffer_reuse_count) < ra_threshold)
++        return;
++
++    for (block_idx = uvm_va_range_block_index(va_range, addr); block_idx < num_blocks; ++block_idx)
++    {
++        status = uvm_va_range_block_create(va_range, block_idx, &va_block);
++        if (status != NV_OK)
++            break;
++
++        nvmgpu_gdirect_prepare_va_block_read(va_block, gdirect, true, false);
++
++        if (UVM_READ_ONCE(gdirect->buffer_reuse_count) == 0)
++            break;
++
++        ++cnt;
++
++        if (cnt >= ra_threshold)
++            break;
++    }
++}
++
++static NV_STATUS nvmgpu_direct_io_copy_range(
 +    uvm_va_block_t *va_block, uvm_gpu_t *gpu, 
 +    uvm_page_index_t page_idx_start, int num_pages,
 +    uvm_push_t *push, bool is_last_range
 +)
 +{
 +    uvm_va_range_t *va_range = va_block->va_range;
-+    uvm_va_space_t *va_space = va_range->va_space;
-+
-+    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
-+    uvm_nvmgpu_gpu_direct_t *gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu->id)];
-+
 +    uvm_nvmgpu_va_range_t *nvmgpu_va_range = va_range->nvmgpu_va_range;
 +
 +    uvm_va_block_gpu_state_t *gpu_state = va_block->gpus[uvm_id_gpu_index(gpu->id)];
 +
 +    struct file *filp = nvmgpu_va_range->filp;
-+    struct kiocb kiocb;
-+    struct iov_iter iter;
-+    ssize_t retcode;
++    size_t file_size = i_size_read(filp->f_mapping->host);
 +
 +    // Calculate the file offset and read size.
-+    loff_t file_start_offset = va_block->start - va_range->node.start + page_idx_start * PAGE_SIZE;
-+    size_t read_size = MIN(num_pages * PAGE_SIZE, i_size_read(filp->f_mapping->host) - file_start_offset);
++    loff_t va_block_f_offset = va_block->start - va_range->node.start;
++    loff_t file_start_offset = va_block_f_offset + page_idx_start * PAGE_SIZE;
++    size_t read_size = MIN(num_pages * PAGE_SIZE, file_size - file_start_offset);
 +    size_t copied_size = 0;
 +
-+    // We should not receive any requests to read anything outside the file range.
-+    UVM_ASSERT(i_size_read(filp->f_mapping->host) >= file_start_offset);
++    uvm_nvmgpu_gdirect_buffer_t *buffer = va_block->nvmgpu.gdirect_buffer;
 +
-+    // Prepare read descriptor.
-+    iov_iter_bvec(&iter, READ, &gpu_direct->bvecs[page_idx_start], num_pages, read_size);
++    UVM_ASSERT(buffer);
++    UVM_ASSERT(buffer->status == UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READY);
 +
-+    init_sync_kiocb(&kiocb, filp);
-+    kiocb.ki_pos = file_start_offset;
-+
-+    // Read from the file into RM memory on GPU.
-+    // It uses direct_io in the background because the file is opened with O_DIRECT.
-+    retcode = call_read_iter(filp, &kiocb, &iter);
-+    if (retcode < 0)
-+    {
-+        printk(KERN_DEBUG "error in call_read_iter with code %ld\n", retcode);
-+        return NV_ERR_OPERATING_SYSTEM;
-+    }
-+
-+    UVM_ASSERT(retcode == read_size);
++    // We should not receive any requests to copy anything outside the file range.
++    UVM_ASSERT(file_size >= file_start_offset);
 +
 +    while (copied_size < read_size)
 +    {
@@ -1125,7 +1477,7 @@ index 0000000..537fd0e
 +        UVM_ASSERT(to_copy_size > 0);
 +
 +        dst = uvm_gpu_address_physical(UVM_APERTURE_VID, chunk->address + chunk_offset);
-+        src = uvm_gpu_address_virtual(gpu_direct->aligned_rm_gpu_va + page_index * PAGE_SIZE);
++        src = uvm_gpu_address_virtual(buffer->aligned_rm_gpu_va + page_index * PAGE_SIZE);
 +
 +        // Pipeline all copies.
 +        uvm_push_set_flag(push, UVM_PUSH_FLAG_CE_NEXT_PIPELINED);
@@ -1161,18 +1513,56 @@ index 0000000..537fd0e
 +{
 +    NV_STATUS status = NV_OK;
 +
++    uvm_va_range_t *va_range = va_block->va_range;
++    uvm_va_space_t *va_space = va_range->va_space;
++
 +    mm_segment_t fs;
 +
-+    uvm_gpu_t *gpu = uvm_va_space_get_gpu(va_block->va_range->va_space, gpu_id);
++    uvm_gpu_t *gpu = uvm_va_space_get_gpu(va_space, gpu_id);
 +    uvm_push_t push;
 +
 +    uvm_page_index_t page_idx;
 +    int page_idx_start = -1;
 +    int num_pages = 0;
 +
++    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
++    uvm_nvmgpu_gdirect_t *gdirect = &nvmgpu_va_space->gdirect_table[uvm_id_gpu_index(gpu_id)];
++
++    #if UVM_NVMGPU_PROFILING
++    struct timespec tv_start, tv_end;
++
++    getnstimeofday(&tv_start);
++    #endif
++
 +    // Nothing in the page_mask. 
 +    if (uvm_page_mask_weight(page_mask) == 0)
 +        return NV_OK;
++
++    // Switch the filesystem space to kernel space.
++    fs = get_fs();
++    set_fs(KERNEL_DS);
++
++    status = nvmgpu_gdirect_prepare_va_block_read(va_block, gdirect, true, true);
++    if (status != NV_OK)
++    {
++        set_fs(fs);
++        printk(KERN_DEBUG "nvmgpu_gdirect_prepare_va_block_read error %s\n", nvstatusToString(status));
++        return status;
++    }
++
++    // Do readahead.
++    if (nvmgpu_gdirect_is_readahead_enabled(gdirect))
++        nvmgpu_gdirect_readahead(va_range, gdirect, va_block->end + 1);
++
++    // Return to the original filesystem space.
++    set_fs(fs);
++
++    #if UVM_NVMGPU_PROFILING
++    getnstimeofday(&tv_end);
++    nvmgpu_va_space->time.dio_read_file += uvm_nvmgpu_timediff(tv_start, tv_end);
++
++    getnstimeofday(&tv_start);
++    #endif
 +
 +    // Initiate a GPU command push channel.
 +    status = uvm_push_begin_acquire(
@@ -1188,10 +1578,6 @@ index 0000000..537fd0e
 +        return status;
 +    }
 +
-+    // Switch the filesystem space to kernel space.
-+    fs = get_fs();
-+    set_fs(KERNEL_DS);
-+
 +    for_each_va_block_page_in_mask(page_idx, page_mask, va_block)
 +    {
 +        if (page_idx_start < 0)
@@ -1206,8 +1592,8 @@ index 0000000..537fd0e
 +        else
 +        {
 +            // Found a non-contiguous page.
-+            // Initiate read for the previous contiguous pages.
-+            status = nvmgpu_direct_io_read_range(va_block, gpu, page_idx_start, num_pages, &push, false);
++            // Initiate copy for the previous contiguous pages.
++            status = nvmgpu_direct_io_copy_range(va_block, gpu, page_idx_start, num_pages, &push, false);
 +            if (status != NV_OK)
 +                goto error;
 +
@@ -1219,13 +1605,23 @@ index 0000000..537fd0e
 +
 +    // Do read for the last group of contiguous pages.
 +    if (num_pages > 0)
-+        status = nvmgpu_direct_io_read_range(va_block, gpu, page_idx_start, num_pages, &push, true);
++        status = nvmgpu_direct_io_copy_range(va_block, gpu, page_idx_start, num_pages, &push, true);
 +
 +error:
-+    // Return to the original filesystem space.
-+    set_fs(fs);
-+
 +    status = uvm_push_end_and_wait(&push);
++
++    #if UVM_NVMGPU_PROFILING
++    if (status == NV_OK)
++    {
++        getnstimeofday(&tv_end);
++
++        nvmgpu_va_space->time.dio_read_memcopy += uvm_nvmgpu_timediff(tv_start, tv_end);
++    }
++    #endif
++
++    if (!va_block->nvmgpu.gdirect_buffer->is_reserved)
++        nvmgpu_gdirect_return_buffer_to_pool(va_block->nvmgpu.gdirect_buffer);
++
 +
 +    return status;
 +}
@@ -1240,7 +1636,7 @@ index 0000000..537fd0e
 +    uvm_va_space_t *va_space = va_range->va_space;
 +
 +    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
-+    uvm_nvmgpu_gpu_direct_t *gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu->id)];
++    uvm_nvmgpu_gdirect_t *gdirect = &nvmgpu_va_space->gdirect_table[uvm_id_gpu_index(gpu->id)];
 +
 +    uvm_nvmgpu_va_range_t *nvmgpu_va_range = va_range->nvmgpu_va_range;
 +
@@ -1254,7 +1650,7 @@ index 0000000..537fd0e
 +    size_t write_size = MIN(num_pages * PAGE_SIZE, uvm_va_range_size(va_range) - file_start_offset);
 +
 +    // Prepare write descriptor.
-+    iov_iter_bvec(&iter, WRITE, &gpu_direct->bvecs[page_index_start], num_pages, write_size);
++    iov_iter_bvec(&iter, WRITE, &gdirect->bvecs[page_index_start], num_pages, write_size);
 +
 +    init_sync_kiocb(&kiocb, filp);
 +    kiocb.ki_pos = file_start_offset;
@@ -1284,7 +1680,7 @@ index 0000000..537fd0e
 +
 +    uvm_nvmgpu_va_space_t *nvmgpu_va_space = va_space->nvmgpu_va_space;
 +
-+    uvm_nvmgpu_gpu_direct_t *gpu_direct = &nvmgpu_va_space->gpu_direct_table[uvm_id_gpu_index(gpu_id)];
++    uvm_nvmgpu_gdirect_t *gdirect = &nvmgpu_va_space->gdirect_table[uvm_id_gpu_index(gpu_id)];
 +
 +    uvm_gpu_t *gpu = uvm_va_space_get_gpu(va_space, gpu_id);
 +    uvm_va_block_gpu_state_t *gpu_state = va_block->gpus[uvm_id_gpu_index(gpu_id)];
@@ -1347,7 +1743,7 @@ index 0000000..537fd0e
 +
 +        // Copy the whole chunk.
 +        src = uvm_gpu_address_physical(UVM_APERTURE_VID, chunk->address + chunk_offset);
-+        dst = uvm_gpu_address_virtual(gpu_direct->aligned_rm_gpu_va + page_index * PAGE_SIZE);
++        dst = uvm_gpu_address_virtual(gdirect->aligned_rm_gpu_va + page_index * PAGE_SIZE);
 +
 +        // Pipeline all copies.
 +        uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_PIPELINED);
@@ -1488,6 +1884,32 @@ index 0000000..537fd0e
 +    return NV_OK;
 +}
 +
++void uvm_nvmgpu_gdirect_remove_buffer_from_va_block(uvm_va_block_t *va_block)
++{
++    uvm_nvmgpu_gdirect_buffer_t *buffer = va_block->nvmgpu.gdirect_buffer;
++    uvm_nvmgpu_gdirect_t *gdirect;
++
++    if (buffer)
++    {
++        gdirect = buffer->gdirect;
++        
++        // Avoid a race condition where gdirect has already been destroyed.
++        if (gdirect)
++        {
++            uvm_mutex_lock(&gdirect->buffer_lock);
++            buffer->status = UVM_NVMGPU_GDIRECT_BUFFER_STATUS_NONE;
++
++            if (!buffer->is_in_reuse_pool && !buffer->is_reserved)
++                nvmgpu_gdirect_return_buffer_to_pool_locked(buffer);
++
++            buffer->va_block = NULL;
++            uvm_mutex_unlock(&gdirect->buffer_lock);
++        }
++
++        va_block->nvmgpu.gdirect_buffer = NULL;
++    }
++}
++
 +/**
 + * Evict out the block. This function can handle both CPU-only and GPU blocks.
 + * 
@@ -1530,7 +1952,7 @@ index 0000000..537fd0e
 +        {
 +            // Force direct flush into the file for UVM_NVMGPU_FLAG_USEHOSTBUF that has no host buffer
 +            if ((nvmgpu_va_range->flags & UVM_NVMGPU_FLAG_USEHOSTBUF) 
-+                && !va_block->nvmgpu_use_uvm_buffer
++                && !va_block->nvmgpu.use_uvm_buffer
 +            )
 +                uvm_nvmgpu_block_set_file_dirty(va_block);
 +
@@ -1565,7 +1987,7 @@ index 0000000..537fd0e
 +
 +    // Flush the data kept in the host memory
 +    if ((nvmgpu_va_range->flags & UVM_NVMGPU_FLAG_USEHOSTBUF)
-+        && va_block->nvmgpu_use_uvm_buffer
++        && va_block->nvmgpu.use_uvm_buffer
 +    ) {
 +        status = uvm_nvmgpu_flush_host_block(va_block, false, NULL);
 +        if (status != NV_OK) {
@@ -1635,7 +2057,7 @@ index 0000000..537fd0e
 +NV_STATUS uvm_nvmgpu_prepare_block_for_hostbuf(uvm_va_block_t *va_block)
 +{
 +    int page_id;
-+    if (!va_block->nvmgpu_use_uvm_buffer) {
++    if (!va_block->nvmgpu.use_uvm_buffer) {
 +        for (page_id = 0; page_id < PAGES_PER_UVM_VA_BLOCK; ++page_id) {
 +            if (va_block->cpu.pages[page_id] != NULL) {
 +                uvm_nvmgpu_unmap_page(va_block, page_id);
@@ -1804,7 +2226,7 @@ index 0000000..537fd0e
 +    // Reclaim blocks based on least recent transfer.
 +    uvm_mutex_lock(&nvmgpu_va_space->lock);
 +    while (!list_empty(&nvmgpu_va_space->lru_head) && counter < nvmgpu_va_space->trash_nr_blocks) {
-+        va_block = list_first_entry(&nvmgpu_va_space->lru_head, uvm_va_block_t, nvmgpu_lru);
++        va_block = list_first_entry(&nvmgpu_va_space->lru_head, uvm_va_block_t, nvmgpu.lru);
 +
 +        // Terminate the loop since we cannot trash out blocks that have a copy on GPU
 +        if (uvm_processor_mask_get_gpu_count(&(va_block->resident)) > 0) {
@@ -1926,10 +2348,10 @@ index 0000000..537fd0e
 +
 diff --git a/kernel/nvidia-uvm/uvm8_nvmgpu.h b/kernel/nvidia-uvm/uvm8_nvmgpu.h
 new file mode 100644
-index 0000000..9b9e862
+index 0000000..05a33a4
 --- /dev/null
 +++ b/kernel/nvidia-uvm/uvm8_nvmgpu.h
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,328 @@
 +#ifndef __UVM8_NVMGPU_H__
 +#define __UVM8_NVMGPU_H__
 +
@@ -1946,27 +2368,77 @@ index 0000000..9b9e862
 +#define UVM_NVMGPU_FLAG_USEHOSTBUF  (1U << 6)
 +#define UVM_NVMGPU_FLAG_DIRECT      (1U << 7)
 +
-+#define UVM_NVMGPU_GPU_DIRECT_BUF_BITS      UVM_VA_BLOCK_BITS
-+#define UVM_NVMGPU_GPU_DIRECT_BUF_SIZE      (1ULL << UVM_NVMGPU_GPU_DIRECT_BUF_BITS)
++#define UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_BITS      UVM_VA_BLOCK_BITS
++#define UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_SIZE      (1ULL << UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_BITS)
 +
-+typedef struct {
++#define UVM_NVMGPU_PROFILING 0
++
++typedef struct uvm_nvmgpu_gdirect_struct uvm_nvmgpu_gdirect_t;
++
++enum uvm_nvmgpu_gdirect_buffer_status_enum
++{
++    UVM_NVMGPU_GDIRECT_BUFFER_STATUS_NONE = 0,
++    UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READING,
++    UVM_NVMGPU_GDIRECT_BUFFER_STATUS_READY
++};
++
++struct uvm_nvmgpu_gdirect_buffer_struct
++{
++    uvm_nvmgpu_gdirect_buffer_status_t status;
++
++    bool is_in_reuse_pool:1;
++    bool is_reserved:1;
++
++    size_t read_size;
++
++    uvm_nvmgpu_gdirect_t *gdirect;
++    uvm_va_block_t *va_block;
++
++    struct kiocb kiocb;
++
++    struct bio_vec *bvecs;
++    NvU64 aligned_rm_gpu_va;
++
++    struct list_head reuse_lh;
++};
++
++struct uvm_nvmgpu_gdirect_struct
++{
 +    bool p2pmem_support;
++
 +    uvm_gpu_t *gpu;
++
 +    uvm_rm_mem_t *rm_mem;
 +    NvU64 aligned_rm_gpu_va;
++
++    unsigned long p2pmem_pfn;
 +    void *p2pmem_va;
 +    size_t p2pmem_size;
 +    unsigned int p2pmem_num_pages;
++
 +    struct bio_vec *bvecs;
-+} uvm_nvmgpu_gpu_direct_t;
++
++    uvm_mutex_t buffer_lock;
++
++    unsigned int num_buffer_groups;
++    uvm_nvmgpu_gdirect_buffer_t *buffers;
++    struct list_head buffer_reuse_head;
++    unsigned int buffer_reuse_count;
++
++    atomic_t num_async_reading;
++};
 +
 +struct uvm_nvmgpu_va_space_struct
 +{
-+    bool is_initailized;
++    bool is_initailized:1;
++    bool gdirect_support:1;
++
 +    // number of blocks to be trashed at a time
 +    unsigned long trash_nr_blocks; 
++
 +    // number of pages reserved for the system 
 +    unsigned long trash_reserved_nr_pages; 
++
 +    // init flags that dictate the optimization behaviors
 +    unsigned short flags;
 +
@@ -1974,7 +2446,20 @@ index 0000000..9b9e862
 +
 +    struct list_head lru_head;
 +
-+    uvm_nvmgpu_gpu_direct_t gpu_direct_table[UVM_ID_MAX_GPUS];
++    uvm_nvmgpu_gdirect_t gdirect_table[UVM_ID_MAX_GPUS];
++
++    #if UVM_NVMGPU_PROFILING
++    struct
++    {
++        NvU64 dio_read_file;
++        NvU64 dio_read_memcopy;
++
++        NvU64 pc_read_file;
++        NvU64 pc_read_memcopy;
++
++        NvU64 populate_gpu_pages;
++    } time;
++    #endif
 +};
 +
 +typedef struct uvm_nvmgpu_va_range_struct
@@ -1994,7 +2479,14 @@ index 0000000..9b9e862
 +    UVM_NVMGPU_FILE_READ_TYPE_DIRECT_IO
 +} uvm_nvmgpu_file_read_type_t;
 +
-+NV_STATUS uvm_nvmgpu_initialize(uvm_va_space_t *va_space, unsigned long trash_nr_blocks, unsigned long trash_reserved_nr_pages, unsigned short flags);
++#if UVM_NVMGPU_PROFILING
++static inline NvU64 uvm_nvmgpu_timediff(struct timespec start, struct timespec end)
++{
++    return (end.tv_sec - start.tv_sec) * 1000000000 + end.tv_nsec - start.tv_nsec;
++}
++#endif
++
++NV_STATUS uvm_nvmgpu_initialize(uvm_va_space_t *va_space, UVM_NVMGPU_INITIALIZE_PARAMS *params);
 +void uvm_nvmgpu_deinitialize(uvm_va_space_t *va_space);
 +
 +NV_STATUS uvm_nvmgpu_register_file_va_space(uvm_va_space_t *va_space, UVM_NVMGPU_REGISTER_FILE_VA_SPACE_PARAMS *params);
@@ -2014,6 +2506,7 @@ index 0000000..9b9e862
 +
 +NV_STATUS uvm_nvmgpu_direct_io_read(uvm_va_block_t *va_block, uvm_gpu_id_t gpu_id, const uvm_page_mask_t *page_mask);
 +NV_STATUS uvm_nvmgpu_direct_io_write(uvm_va_block_t *va_block, uvm_page_mask_t *page_mask);
++void uvm_nvmgpu_gdirect_remove_buffer_from_va_block(uvm_va_block_t *va_block);
 +
 +NV_STATUS uvm_nvmgpu_reduce_memory_consumption(uvm_va_space_t *va_space);
 +
@@ -2090,7 +2583,7 @@ index 0000000..9b9e862
 +        || (nvmgpu_va_range->flags & UVM_NVMGPU_FLAG_VOLATILE)
 +        // Use CPU buffer and data is still on that buffer
 +        || ((nvmgpu_va_range->flags & UVM_NVMGPU_FLAG_USEHOSTBUF)
-+            && va_block->nvmgpu_use_uvm_buffer
++            && va_block->nvmgpu.use_uvm_buffer
 +        )
 +    )
 +        return UVM_NVMGPU_FILE_READ_TYPE_NONE;
@@ -2182,13 +2675,13 @@ index 0000000..9b9e862
 +    
 +    // Move this block to the tail of the LRU list.
 +    uvm_mutex_lock(&nvmgpu_va_space->lock);
-+    list_move_tail(&va_block->nvmgpu_lru, &nvmgpu_va_space->lru_head);
++    list_move_tail(&va_block->nvmgpu.lru, &nvmgpu_va_space->lru_head);
 +    uvm_mutex_unlock(&nvmgpu_va_space->lock);
 +}
 +
 +#endif
 diff --git a/kernel/nvidia-uvm/uvm8_va_block.c b/kernel/nvidia-uvm/uvm8_va_block.c
-index 36a226d..78d54b8 100644
+index 36a226d..d83a015 100644
 --- a/kernel/nvidia-uvm/uvm8_va_block.c
 +++ b/kernel/nvidia-uvm/uvm8_va_block.c
 @@ -38,6 +38,7 @@
@@ -2199,7 +2692,15 @@ index 36a226d..78d54b8 100644
  
  typedef enum
  {
-@@ -871,8 +872,13 @@ static NV_STATUS block_populate_page_cpu(uvm_va_block_t *block, uvm_page_index_t
+@@ -532,6 +533,7 @@ NV_STATUS uvm_va_block_create(uvm_va_range_t *va_range,
+         status = NV_ERR_NO_MEMORY;
+         goto error;
+     }
++    INIT_LIST_HEAD(&block->nvmgpu.lru);
+ 
+     *out_block = block;
+     return NV_OK;
+@@ -871,8 +873,13 @@ static NV_STATUS block_populate_page_cpu(uvm_va_block_t *block, uvm_page_index_t
          gfp_flags |= __GFP_ZERO;
  
      page = alloc_pages(gfp_flags, 0);
@@ -2215,15 +2716,43 @@ index 36a226d..78d54b8 100644
  
      // the kernel has 'written' zeros to this page, so it is dirty
      if (zero)
-@@ -883,6 +889,7 @@ static NV_STATUS block_populate_page_cpu(uvm_va_block_t *block, uvm_page_index_t
+@@ -883,6 +890,7 @@ static NV_STATUS block_populate_page_cpu(uvm_va_block_t *block, uvm_page_index_t
          goto error;
  
      block->cpu.pages[page_index] = page;
-+    block->nvmgpu_use_uvm_buffer = true;
++    block->nvmgpu.use_uvm_buffer = true;
      return NV_OK;
  
  error:
-@@ -1916,16 +1923,23 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
+@@ -1865,6 +1873,14 @@ static NV_STATUS block_populate_pages_gpu(uvm_va_block_t *block,
+     uvm_chunk_size_t chunk_size;
+     NV_STATUS status;
+ 
++    #if UVM_NVMGPU_PROFILING
++    uvm_nvmgpu_va_space_t *nvmgpu_va_space = block->va_range->va_space->nvmgpu_va_space;
++
++    struct timespec tv_start, tv_end;
++
++    getnstimeofday(&tv_start);
++    #endif
++
+     page_index = uvm_va_block_first_page_in_mask(region, populate_mask);
+     if (page_index == region.outer)
+         return NV_OK;
+@@ -1890,6 +1906,12 @@ static NV_STATUS block_populate_pages_gpu(uvm_va_block_t *block,
+         chunk_region = uvm_va_block_region(chunk_region.outer, chunk_region.outer + (chunk_size / PAGE_SIZE));
+     }
+ 
++    #if UVM_NVMGPU_PROFILING
++    getnstimeofday(&tv_end);
++
++    nvmgpu_va_space->time.populate_gpu_pages += uvm_nvmgpu_timediff(tv_start, tv_end);
++    #endif
++
+     return NV_OK;
+ }
+ 
+@@ -1916,16 +1938,23 @@ static NV_STATUS block_populate_pages(uvm_va_block_t *block,
      if (UVM_ID_IS_GPU(dest_id))
          return block_populate_pages_gpu(block, retry, block_get_gpu(block, dest_id), region, populate_page_mask);
  
@@ -2257,7 +2786,7 @@ index 36a226d..78d54b8 100644
      }
  
      return NV_OK;
-@@ -2428,7 +2442,8 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
+@@ -2428,7 +2457,8 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
              uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_PIPELINED);
          }
  
@@ -2267,7 +2796,7 @@ index 36a226d..78d54b8 100644
  
          if (last_index == region.outer) {
              contig_start_index = page_index;
-@@ -2748,6 +2763,7 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
+@@ -2748,6 +2778,7 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
      NV_STATUS status = NV_OK;
      NV_STATUS tracker_status;
      uvm_tracker_t local_tracker = UVM_TRACKER_INIT();
@@ -2275,7 +2804,7 @@ index 36a226d..78d54b8 100644
      uvm_page_mask_t *resident_mask = uvm_va_block_resident_mask_get(block, dst_id);
      NvU32 missing_pages_count;
      NvU32 pages_copied;
-@@ -2835,20 +2851,43 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
+@@ -2835,20 +2866,43 @@ static NV_STATUS block_copy_resident_pages(uvm_va_block_t *block,
                                       BLOCK_TRANSFER_MODE_INTERNAL_MOVE_TO_STAGE;
      }
  
@@ -2333,20 +2862,31 @@ index 36a226d..78d54b8 100644
  
      // If destination is the CPU then we copied everything there above
      if (UVM_ID_IS_CPU(dst_id)) {
-@@ -2946,6 +2985,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -2946,6 +3000,23 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      uvm_page_mask_t *unmap_page_mask = &va_block_context->make_resident.page_mask;
      uvm_page_mask_t *resident_mask;
  
 +    bool do_nvmgpu_write = false;
 +    uvm_nvmgpu_va_range_t *nvmgpu_va_range = NULL;
 +
-+    if (uvm_nvmgpu_is_managed(va_range))
++    #if UVM_NVMGPU_PROFILING
++    uvm_nvmgpu_va_space_t *nvmgpu_va_space = NULL;
++
++    struct timespec tv_start = {0}, tv_end = {0};
++    #endif
++
++    if (uvm_nvmgpu_is_managed(va_range)) {
 +        nvmgpu_va_range = va_range->nvmgpu_va_range;
++
++        #if UVM_NVMGPU_PROFILING
++        nvmgpu_va_space = va_range->va_space->nvmgpu_va_space;
++        #endif
++    }
 +
      va_block_context->make_resident.dest_id = dest_id;
      va_block_context->make_resident.cause = cause;
  
-@@ -2959,6 +3004,25 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -2959,6 +3030,25 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      UVM_ASSERT(va_block->va_range);
      UVM_ASSERT(va_block->va_range->type == UVM_VA_RANGE_TYPE_MANAGED);
  
@@ -2372,7 +2912,7 @@ index 36a226d..78d54b8 100644
      resident_mask = block_resident_mask_get_alloc(va_block, dest_id);
      if (!resident_mask)
          return NV_ERR_NO_MEMORY;
-@@ -2997,9 +3061,16 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -2997,9 +3087,22 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      // va_block_context->make_resident.page_mask.
      unmap_page_mask = NULL;
  
@@ -2389,10 +2929,30 @@ index 36a226d..78d54b8 100644
 +        if (status != NV_OK)
 +            return status;
 +    }
++
++
++    #if UVM_NVMGPU_PROFILING
++    if (uvm_nvmgpu_is_managed(va_range))
++        getnstimeofday(&tv_start);
++    #endif
  
      status = block_copy_resident_pages(va_block,
                                         va_block_context,
-@@ -3019,6 +3090,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+@@ -3011,6 +3114,13 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
+     if (status != NV_OK)
+         return status;
+ 
++    #if UVM_NVMGPU_PROFILING
++    if (uvm_nvmgpu_is_managed(va_range)) {
++        getnstimeofday(&tv_end);
++        nvmgpu_va_space->time.pc_read_memcopy += uvm_nvmgpu_timediff(tv_start, tv_end);
++    }
++    #endif
++
+     // Update eviction heuristics, if needed. Notably this could repeat the call
+     // done in block_set_resident_processor(), but that doesn't do anything bad
+     // and it's simpler to keep it in both places.
+@@ -3019,6 +3129,12 @@ NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *va_block,
      // empty).
      if (uvm_processor_mask_test(&va_block->resident, dest_id))
          block_mark_memory_used(va_block, dest_id);
@@ -2405,7 +2965,7 @@ index 36a226d..78d54b8 100644
  
      return NV_OK;
  }
-@@ -3866,9 +3943,10 @@ static void block_unmap_cpu(uvm_va_block_t *block, uvm_va_block_region_t region,
+@@ -3866,9 +3982,10 @@ static void block_unmap_cpu(uvm_va_block_t *block, uvm_va_block_region_t region,
          if (!block_has_valid_mapping_cpu(block, subregion))
              continue;
  
@@ -2419,7 +2979,17 @@ index 36a226d..78d54b8 100644
  
          for (pte_bit = 0; pte_bit < UVM_PTE_BITS_CPU_MAX; pte_bit++)
              uvm_page_mask_region_clear(&block->cpu.pte_bits[pte_bit], subregion);
-@@ -7755,17 +7833,20 @@ static void block_kill(uvm_va_block_t *block)
+@@ -7730,6 +7847,9 @@ static void block_kill(uvm_va_block_t *block)
+     event_data.block_destroy.block = block;
+     uvm_perf_event_notify(&va_space->perf_events, UVM_PERF_EVENT_BLOCK_DESTROY, &event_data);
+ 
++    if (block->nvmgpu.gdirect_buffer)
++        uvm_nvmgpu_gdirect_remove_buffer_from_va_block(block);
++
+     // Unmap all processors in parallel first. Unmapping the whole block won't
+     // cause a page table split, so this should only fail if we have a system-
+     // fatal error.
+@@ -7755,17 +7875,20 @@ static void block_kill(uvm_va_block_t *block)
  
      // Free CPU pages
      if (block->cpu.pages) {
@@ -2433,7 +3003,7 @@ index 36a226d..78d54b8 100644
 -            }
 -            else {
 -                UVM_ASSERT(!uvm_page_mask_test(&block->cpu.resident, page_index));
-+        if (block->nvmgpu_use_uvm_buffer) {
++        if (block->nvmgpu.use_uvm_buffer) {
 +            uvm_page_index_t page_index;
 +            for_each_va_block_page(page_index, block) {
 +                if (block->cpu.pages[page_index]) {
@@ -2446,11 +3016,11 @@ index 36a226d..78d54b8 100644
 +                    UVM_ASSERT(!uvm_page_mask_test(&block->cpu.resident, page_index));
 +                }
              }
-+            block->nvmgpu_use_uvm_buffer = false;
++            block->nvmgpu.use_uvm_buffer = false;
          }
  
          // Clearing the resident bit isn't strictly necessary since this block
-@@ -9426,6 +9507,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9426,6 +9549,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
      uvm_perf_prefetch_hint_t prefetch_hint = UVM_PERF_PREFETCH_HINT_NONE();
      uvm_processor_mask_t processors_involved_in_cpu_migration;
  
@@ -2458,7 +3028,7 @@ index 36a226d..78d54b8 100644
      uvm_assert_mutex_locked(&va_block->lock);
      UVM_ASSERT(va_range->type == UVM_VA_RANGE_TYPE_MANAGED);
  
-@@ -9525,6 +9607,28 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9525,6 +9649,28 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
              uvm_page_mask_andnot(&service_context->block_context.caller_page_mask,
                                   new_residency_mask,
                                   &service_context->read_duplicate_mask)) {
@@ -2477,7 +3047,7 @@ index 36a226d..78d54b8 100644
 +            // This va_block uses host buffer and is being touch. Move it to
 +            // the LRU's tail so that we won't evict it too soon.
 +            if (uvm_nvmgpu_is_managed(va_block->va_range) 
-+                && (va_block->nvmgpu_use_uvm_buffer)
++                && (va_block->nvmgpu.use_uvm_buffer)
 +            )
 +                uvm_nvmgpu_block_mark_recent_in_buffer(va_block);
 +
@@ -2487,7 +3057,7 @@ index 36a226d..78d54b8 100644
              status = uvm_va_block_make_resident(va_block,
                                                  block_retry,
                                                  &service_context->block_context,
-@@ -9536,7 +9640,14 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9536,7 +9682,14 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                  prefetch_hint.prefetch_pages_mask,
                                                  cause);
              if (status != NV_OK)
@@ -2503,7 +3073,7 @@ index 36a226d..78d54b8 100644
          }
  
          if (service_context->read_duplicate_count != 0 &&
-@@ -9552,7 +9663,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9552,7 +9705,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                                 prefetch_hint.prefetch_pages_mask,
                                                                 cause);
              if (status != NV_OK)
@@ -2512,7 +3082,7 @@ index 36a226d..78d54b8 100644
          }
  
          if (UVM_ID_IS_CPU(new_residency)) {
-@@ -9657,7 +9768,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9657,7 +9810,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                         &service_context->revocation_mask,
                                                         revoke_prot);
                  if (status != NV_OK)
@@ -2521,7 +3091,7 @@ index 36a226d..78d54b8 100644
              }
          }
      }
-@@ -9696,7 +9807,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9696,7 +9849,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                  status = NV_OK;
              }
              if (status != NV_OK)
@@ -2530,7 +3100,7 @@ index 36a226d..78d54b8 100644
          }
      }
  
-@@ -9722,7 +9833,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9722,7 +9875,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                          map_prot_mask,
                                          NULL);
              if (status != NV_OK)
@@ -2539,7 +3109,7 @@ index 36a226d..78d54b8 100644
          }
  
          // 3.2 - Add new mappings
-@@ -9747,7 +9858,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9747,7 +9900,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                            UvmEventMapRemoteCauseThrashing,
                                            &va_block->tracker);
                  if (status != NV_OK)
@@ -2548,7 +3118,7 @@ index 36a226d..78d54b8 100644
  
                  // Remove thrashing pages from the map mask
                  pages_need_mapping = uvm_page_mask_andnot(helper_page_mask,
-@@ -9769,7 +9880,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9769,7 +9922,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                    UvmEventMapRemoteCausePolicy,
                                    &va_block->tracker);
          if (status != NV_OK)
@@ -2557,7 +3127,7 @@ index 36a226d..78d54b8 100644
      }
  
      // 4- If pages did migrate, map SetAccessedBy processors, except for UVM-Lite
-@@ -9815,7 +9926,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9815,7 +9968,7 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                                         new_prot,
                                                                         map_thrashing_processors);
                      if (status != NV_OK)
@@ -2566,7 +3136,7 @@ index 36a226d..78d54b8 100644
                  }
  
                  pages_need_mapping = uvm_page_mask_andnot(map_prot_mask,
-@@ -9835,11 +9946,23 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
+@@ -9835,11 +9988,23 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
                                                                 new_prot,
                                                                 NULL);
              if (status != NV_OK)
@@ -2593,20 +3163,23 @@ index 36a226d..78d54b8 100644
  
  // Check if we are faulting on a page with valid permissions to check if we can
 diff --git a/kernel/nvidia-uvm/uvm8_va_block.h b/kernel/nvidia-uvm/uvm8_va_block.h
-index bca1c6e..698bb2b 100644
+index bca1c6e..160c94c 100644
 --- a/kernel/nvidia-uvm/uvm8_va_block.h
 +++ b/kernel/nvidia-uvm/uvm8_va_block.h
-@@ -452,6 +452,9 @@ struct uvm_va_block_struct
+@@ -452,6 +452,12 @@ struct uvm_va_block_struct
      nv_kthread_q_item_t eviction_mappings_q_item;
  
      uvm_perf_module_data_desc_t perf_modules_data[UVM_PERF_MODULE_TYPE_COUNT];
 +
-+    bool nvmgpu_use_uvm_buffer;
-+    struct list_head nvmgpu_lru;
++    struct {
++        bool use_uvm_buffer;
++        struct list_head lru;
++        uvm_nvmgpu_gdirect_buffer_t *gdirect_buffer;
++    } nvmgpu;
  };
  
  // We define additional per-VA Block fields for testing. When
-@@ -1347,6 +1350,11 @@ static void uvm_page_mask_zero(uvm_page_mask_t *mask)
+@@ -1347,6 +1353,11 @@ static void uvm_page_mask_zero(uvm_page_mask_t *mask)
      bitmap_zero(mask->bitmap, PAGES_PER_UVM_VA_BLOCK);
  }
  
@@ -2630,19 +3203,6 @@ index b0642dc..2679ad2 100644
  
      UVM_MAKE_RESIDENT_CAUSE_MAX
  } uvm_make_resident_cause_t;
-diff --git a/kernel/nvidia-uvm/uvm8_va_range.c b/kernel/nvidia-uvm/uvm8_va_range.c
-index 95fd350..5335164 100644
---- a/kernel/nvidia-uvm/uvm8_va_range.c
-+++ b/kernel/nvidia-uvm/uvm8_va_range.c
-@@ -1142,6 +1142,8 @@ NV_STATUS uvm_va_range_block_create(uvm_va_range_t *va_range, size_t index, uvm_
-             uvm_va_block_release(block);
-             block = old;
-         }
-+        else
-+            INIT_LIST_HEAD(&block->nvmgpu_lru);
-     }
- 
-     *out_block = block;
 diff --git a/kernel/nvidia-uvm/uvm8_va_range.h b/kernel/nvidia-uvm/uvm8_va_range.h
 index 49b3b43..d998ee7 100644
 --- a/kernel/nvidia-uvm/uvm8_va_range.h
@@ -2705,7 +3265,7 @@ index 1d052f3..4969a6e 100644
      // new minor devices just above the following field:
      NVIDIA_UVM_NUM_MINOR_DEVICES
 diff --git a/kernel/nvidia-uvm/uvm_ioctl.h b/kernel/nvidia-uvm/uvm_ioctl.h
-index 069a9f2..6300ae0 100644
+index 069a9f2..b63a6a6 100644
 --- a/kernel/nvidia-uvm/uvm_ioctl.h
 +++ b/kernel/nvidia-uvm/uvm_ioctl.h
 @@ -23,6 +23,7 @@
@@ -2716,7 +3276,7 @@ index 069a9f2..6300ae0 100644
  #include "uvmtypes.h"
  
  #ifdef __cplusplus
-@@ -1038,6 +1039,47 @@ typedef struct
+@@ -1038,6 +1039,48 @@ typedef struct
      NV_STATUS       rmStatus;                    // OUT
  } UVM_VALIDATE_VA_RANGE_PARAMS;
  
@@ -2729,6 +3289,7 @@ index 069a9f2..6300ae0 100644
 +{
 +    unsigned long    trash_nr_blocks;           // IN
 +    unsigned long    trash_reserved_nr_pages;   // IN
++    unsigned int     gdirect_num_groups;        // IN
 +    unsigned short   flags;                     // IN
 +    NV_STATUS        rmStatus;                  // OUT
 +} UVM_NVMGPU_INITIALIZE_PARAMS;

@@ -27,12 +27,15 @@
 #define DEFAULT_TRASH_NR_BLOCKS 16
 #define DEFAULT_TRASH_NR_RESERVED_PAGES ((unsigned long)1 << 21)
 
-#define DRAGON_ENVNAME_ENABLE_READ_CACHE    "DRAGON_ENABLE_READ_CACHE"
-#define DRAGON_ENVNAME_ENABLE_LAZY_WRITE    "DRAGON_ENABLE_LAZY_WRITE"
-#define DRAGON_ENVNAME_ENABLE_AIO_READ      "DRAGON_ENABLE_AIO_READ"
-#define DRAGON_ENVNAME_ENABLE_AIO_WRITE     "DRAGON_ENABLE_AIO_WRITE"
-#define DRAGON_ENVNAME_READAHEAD_TYPE       "DRAGON_READAHEAD_TYPE"
-#define DRAGON_ENVNAME_NR_RESERVED_PAGES    "DRAGON_NR_RESERVED_PAGES"
+#define DEFAULT_GDIRECT_NUM_GROUPS 1
+
+#define DRAGON_ENVNAME_ENABLE_READ_CACHE            "DRAGON_ENABLE_READ_CACHE"
+#define DRAGON_ENVNAME_ENABLE_LAZY_WRITE            "DRAGON_ENABLE_LAZY_WRITE"
+#define DRAGON_ENVNAME_ENABLE_AIO_READ              "DRAGON_ENABLE_AIO_READ"
+#define DRAGON_ENVNAME_ENABLE_AIO_WRITE             "DRAGON_ENABLE_AIO_WRITE"
+#define DRAGON_ENVNAME_READAHEAD_TYPE               "DRAGON_READAHEAD_TYPE"
+#define DRAGON_ENVNAME_NR_RESERVED_PAGES            "DRAGON_NR_RESERVED_PAGES"
+#define DRAGON_ENVNAME_DIRECT_NUM_GROUPS            "DRAGON_DIRECT_NUM_GROUPS"
 
 #define DRAGON_INIT_FLAG_ENABLE_READ_CACHE      0x01
 #define DRAGON_INIT_FLAG_ENABLE_LAZY_WRITE      0x02
@@ -48,6 +51,7 @@ typedef struct
 {
     unsigned long trash_nr_blocks;
     unsigned long trash_reserved_nr_pages;
+    unsigned int gdirect_num_groups;
     unsigned short flags;
     unsigned int status;
 } dragon_ioctl_init_t;
@@ -100,6 +104,7 @@ static dragonError_t init_module()
 
     request.trash_nr_blocks = DEFAULT_TRASH_NR_BLOCKS;
     request.trash_reserved_nr_pages = DEFAULT_TRASH_NR_RESERVED_PAGES;
+    request.gdirect_num_groups = DEFAULT_GDIRECT_NUM_GROUPS;
     request.flags = 0;
 
     env_val = secure_getenv(DRAGON_ENVNAME_NR_RESERVED_PAGES);
@@ -140,9 +145,29 @@ static dragonError_t init_module()
     else
         fadvice = POSIX_FADV_NORMAL;
 
+    env_val = secure_getenv(DRAGON_ENVNAME_DIRECT_NUM_GROUPS);
+    if (env_val)
+    {
+        int gdirect_num_groups = atoi(env_val);
+        if (gdirect_num_groups < 0)
+            gdirect_num_groups = 0;
+        request.gdirect_num_groups = gdirect_num_groups;
+    }
+
+    if (request.gdirect_num_groups > 0)
+        fprintf(stderr, "Request DRAGON-DIRECT setup\n");
+
+    if (request.gdirect_num_groups > 1)
+        fprintf(stderr, "Request DRAGON-DIRECT readahead support\n");
+
     if ((status = ioctl(nvidia_uvm_fd, DRAGON_IOCTL_INIT, &request)) != 0)
     {
         fprintf(stderr, "ioctl init error: %d\n", status);
+        return D_ERR_IOCTL;
+    }
+    if (request.status)
+    {
+        fprintf(stderr, "ioctl uvm init error: %u\n", request.status);
         return D_ERR_IOCTL;
     }
 
@@ -236,6 +261,12 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
         ret = D_ERR_IOCTL;
         goto _out_err_3;
     }
+    if (request->status)
+    {
+        fprintf(stderr, "ioctl uvm error: %u\n", request->status);
+        ret = D_ERR_IOCTL;
+        goto _out_err_3;
+    }
 
     *addr = (void *)request->uvm_addr;
 
@@ -271,6 +302,11 @@ dragonError_t dragon_remap(void *addr, unsigned int flags)
     if ((status = ioctl(nvidia_uvm_fd, DRAGON_IOCTL_REMAP, request)) != 0)
     {
         fprintf(stderr, "ioctl error: %d\n", status);
+        return D_ERR_IOCTL;
+    }
+    if (request->status)
+    {
+        fprintf(stderr, "ioctl uvm error: %u\n", request->status);
         return D_ERR_IOCTL;
     }
 
