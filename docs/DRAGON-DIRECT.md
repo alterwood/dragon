@@ -91,13 +91,13 @@ We add one more flag called *D_F_DIRECT*. Look at
 *DRAGON_DIRECT_NUM_GROUPS* environment variable has been included. This variable
 control the behavior of DRAGON-DIRECT.
 
-- *DRAGON_DIRECT_NUM_GROUPS=0*: Disable DRAGON-DIRECT. No GPUDirect-related
+- `DRAGON_DIRECT_NUM_GROUPS=0`: Disable DRAGON-DIRECT. No GPUDirect-related
   buffers will be allocated. However, *D_F_DIRECT* will always failed.
 
-- *DRAGON_DIRECT_NUM_GROUPS=1*: Enable DRAGON-DIRECT. GPUDirect readahead is
+- `DRAGON_DIRECT_NUM_GROUPS=1`: Enable DRAGON-DIRECT. GPUDirect readahead is
   disabled.
 
-- *DRAGON_DIRECT_NUM_GROUPS=<i>* (i > 1): Enable DRAGON-DIRECT and GPUDirect
+- `DRAGON_DIRECT_NUM_GROUPS=<i>` (i > 1): Enable DRAGON-DIRECT and GPUDirect
   readahead. More buffer on GPU memory and BAR1 will be allocated. The
   additional size is i * 2MB. If GPU does not have enough memory or BAR1, the
   entire DRAGON-DIRECT will be turn off. Use *dmesg* to see the status.
