@@ -59,7 +59,7 @@ within the GPU BAR1 range. Although there is no official documentataion, we
 guess that that CPU-accessible pointer is mapped through BAR1, similar to how
 [GDRCopy](https://github.com/NVIDIA/gdrcopy) works.
 
-## How to use this feature
+## Installation
 
 Installation is the same as how you install DRAGON (see
 [INSTALL.md](../INSTALL.md)). However, there are more steps you need to
@@ -83,8 +83,24 @@ See https://elixir.bootlin.com/linux/v5.4.28/source/drivers/pci/p2pdma.c#L276.
 [nvidia-uvm-440.33.01-linux-kernel-5.4.28.patch](../drivers/nvidia-uvm-440.33.01-linux-kernel-5.4.28.patch)
 has this feature implemented.
 
+## How to use this feature
+
 We add one more flag called *D_F_DIRECT*. Look at
 [read-direct.cu](../tests/sanity-basic/read-direct.cu) for example code.
+
+*DRAGON_DIRECT_NUM_GROUPS* environment variable has been included. This variable
+control the behavior of DRAGON-DIRECT.
+
+- *DRAGON_DIRECT_NUM_GROUPS=0*: Disable DRAGON-DIRECT. No GPUDirect-related
+  buffers will be allocated. However, *D_F_DIRECT* will always failed.
+
+- *DRAGON_DIRECT_NUM_GROUPS=1*: Enable DRAGON-DIRECT. GPUDirect readahead is
+  disabled.
+
+- *DRAGON_DIRECT_NUM_GROUPS=<i>* (i > 1): Enable DRAGON-DIRECT and GPUDirect
+  readahead. More buffer on GPU memory and BAR1 will be allocated. The
+  additional size is i * 2MB. If GPU does not have enough memory or BAR1, the
+  entire DRAGON-DIRECT will be turn off. Use *dmesg* to see the status.
 
 ## Current limitations
 
