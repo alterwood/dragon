@@ -111,3 +111,29 @@ support for other combinations of flags later.
 put the file elsewhere. Currently, there is no checking for the location of your
 file.
 
+## Benchmarks
+
+### System
+
+- **Motherboard:** MSI MPG Z390 GAMING EDGE AC ATX LGA1151
+- **CPU:** i5-9600K @ 3.70 GHz
+- **GPU:** GeForce RTX-2070
+- **RAM:** DDR4-2666 32GB
+- **Storage:** Crucial P1 1 TB M.2-2280 NVME SSD
+- **CUDA:** 10.2
+- **NVIDIA driver:** 440.33.01
+- **Linux kernel:** 5.4.28
+
+*Note:* No PCIe switch. All components are connected via the host bridge.
+
+### Read bandwidth
+
+![read-bw img](imgs/read-bw-pc-direct-comparison.png)
+
+- **Application:** [read-bw.cu](../benchmarks/read-bw/read-bw.cu)
+- Compared the read bandwidth when using different data transfer optimizations
+  in DRAGON.
+  - **pc-agg:** Using host staging via page-cache with aggressive readahead.
+  - **pc-norm:** Using host staging via page-cache with ordinary readahead.
+  - **pc-dis:** Using host staging via page-cache without readahead. 
+  - **direct:** Using GPU memory staging with GPUDirect. No readahead.
