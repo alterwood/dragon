@@ -116,10 +116,10 @@ index fad4ac3..4addb83 100644
          uvm_va_space_up_read(va_space);
 diff --git a/kernel/nvidia-uvm/uvm8_nvmgpu.c b/kernel/nvidia-uvm/uvm8_nvmgpu.c
 new file mode 100644
-index 0000000..3fafb25
+index 0000000..5c9bbb4
 --- /dev/null
 +++ b/kernel/nvidia-uvm/uvm8_nvmgpu.c
-@@ -0,0 +1,2226 @@
+@@ -0,0 +1,2227 @@
 +#include <linux/syscalls.h>
 +#include <linux/delay.h>
 +#include <linux/aio.h>
@@ -1390,6 +1390,7 @@ index 0000000..3fafb25
 +    uvm_va_block_t *va_block;
 +
 +    const unsigned int ra_threshold = (gdirect->num_buffer_groups - 1) / 2;
++    const unsigned int ra_read_limit = (gdirect->num_buffer_groups - 1) * 3 / 4;
 +    unsigned int cnt = 0;
 +
 +    // Readahead is disabled.
@@ -1410,14 +1411,14 @@ index 0000000..3fafb25
 +        if (status != NV_OK)
 +            break;
 +
-+        nvmgpu_gdirect_prepare_va_block_read(va_block, gdirect, true, false);
++        nvmgpu_gdirect_prepare_va_block_read(va_block, gdirect, UVM_NVMGPU_GDIRECT_RA_USE_SYNC, false);
 +
 +        if (UVM_READ_ONCE(gdirect->buffer_reuse_count) == 0)
 +            break;
 +
 +        ++cnt;
 +
-+        if (cnt >= ra_threshold)
++        if (cnt >= ra_read_limit)
 +            break;
 +    }
 +}
@@ -2348,10 +2349,10 @@ index 0000000..3fafb25
 +
 diff --git a/kernel/nvidia-uvm/uvm8_nvmgpu.h b/kernel/nvidia-uvm/uvm8_nvmgpu.h
 new file mode 100644
-index 0000000..05a33a4
+index 0000000..2691a03
 --- /dev/null
 +++ b/kernel/nvidia-uvm/uvm8_nvmgpu.h
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,329 @@
 +#ifndef __UVM8_NVMGPU_H__
 +#define __UVM8_NVMGPU_H__
 +
@@ -2370,6 +2371,7 @@ index 0000000..05a33a4
 +
 +#define UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_BITS      UVM_VA_BLOCK_BITS
 +#define UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_SIZE      (1ULL << UVM_NVMGPU_GDIRECT_PER_GROUP_BUF_BITS)
++#define UVM_NVMGPU_GDIRECT_RA_USE_SYNC             true
 +
 +#define UVM_NVMGPU_PROFILING 0
 +
