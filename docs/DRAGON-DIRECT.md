@@ -94,12 +94,11 @@ control the behavior of DRAGON-DIRECT.
 - `DRAGON_DIRECT_NUM_GROUPS=0`: Disable DRAGON-DIRECT. No GPUDirect-related
   buffers will be allocated. However, *D_F_DIRECT* will always failed.
 
-- `DRAGON_DIRECT_NUM_GROUPS=1`: Enable DRAGON-DIRECT. GPUDirect readahead is
-  disabled.
+- `DRAGON_DIRECT_NUM_GROUPS=1`: Enable DRAGON-DIRECT. 
 
-- `DRAGON_DIRECT_NUM_GROUPS=<i>` (i > 1): Enable DRAGON-DIRECT and GPUDirect
-  readahead. More buffer on GPU memory and BAR1 will be allocated. The
-  additional size is i * 2MB. If GPU does not have enough memory or BAR1, the
+- `DRAGON_DIRECT_NUM_GROUPS=<i>` (i > 1): Enable DRAGON-DIRECT and with *i*
+  buffer groups. More buffer on GPU memory and BAR1 will be allocated. The
+  additional size is *i * 2MB*. If GPU does not have enough memory or BAR1, the
   entire DRAGON-DIRECT will be turn off. Use *dmesg* to see the status.
 
 ## Current limitations
@@ -120,6 +119,7 @@ file.
 - **GPU:** GeForce RTX-2070
 - **RAM:** DDR4-2666 32GB
 - **Storage:** Crucial P1 1 TB M.2-2280 NVME SSD
+- **Filesystem:** ext4
 - **CUDA:** 10.2
 - **NVIDIA driver:** 440.33.01
 - **Linux kernel:** 5.4.28

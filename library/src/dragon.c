@@ -29,6 +29,7 @@
 
 #define DEFAULT_GDIRECT_NUM_GROUPS 1
 
+#define DRAGON_ENVNAME_ENABLE_LOGGING               "DRAGON_ENABLE_LOGGING"
 #define DRAGON_ENVNAME_ENABLE_READ_CACHE            "DRAGON_ENABLE_READ_CACHE"
 #define DRAGON_ENVNAME_ENABLE_LAZY_WRITE            "DRAGON_ENABLE_LAZY_WRITE"
 #define DRAGON_ENVNAME_ENABLE_AIO_READ              "DRAGON_ENABLE_AIO_READ"
@@ -41,6 +42,26 @@
 #define DRAGON_INIT_FLAG_ENABLE_LAZY_WRITE      0x02
 #define DRAGON_INIT_FLAG_ENABLE_AIO_READ        0x04
 #define DRAGON_INIT_FLAG_ENABLE_AIO_WRITE       0x08
+
+static int dragon_enable_logging = -1;
+
+static void dragon_print_msg(const char *fmt, ...)
+{
+    if (dragon_enable_logging == -1) {
+        const char *env = secure_getenv(DRAGON_ENVNAME_ENABLE_LOGGING);
+        if (env)
+            dragon_enable_logging = 1;
+        else
+            dragon_enable_logging = 0;
+    }
+    if (dragon_enable_logging) {
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+    }
+}
+
+#define DRAGON_PRINT_DBG(FMT, ARGS...) dragon_print_msg("libdragon dbg: " FMT, ## ARGS)
 
 static int nvidia_uvm_fd = -1;
 static int fadvice = -1;
@@ -98,7 +119,7 @@ static dragonError_t init_module()
     }
     if (nvidia_uvm_fd < 0)
     {
-        fprintf(stderr, "Cannot open %s\n", PSF_DIR);
+        DRAGON_PRINT_DBG("Cannot open %s\n", PSF_DIR);
         return D_ERR_UVM;
     }
 
@@ -113,7 +134,7 @@ static dragonError_t init_module()
         if (*env_val != '\0' && *endptr == '\0')
             request.trash_reserved_nr_pages = (unsigned long)nr_pages;
     }
-    fprintf(stderr, "reserved_nr_pages: %lu\n", request.trash_reserved_nr_pages);
+    DRAGON_PRINT_DBG("reserved_nr_pages: %lu\n", request.trash_reserved_nr_pages);
 
     env_val = secure_getenv(DRAGON_ENVNAME_ENABLE_READ_CACHE);
     if (!(env_val && strncasecmp(env_val, "no", 2) == 0))
@@ -135,12 +156,12 @@ static dragonError_t init_module()
     if (env_val && strncasecmp(env_val, "agg", 3) == 0)
     {
         fadvice = POSIX_FADV_SEQUENTIAL;
-        fprintf(stderr, "Aggressive read ahead is enabled.\n");
+        DRAGON_PRINT_DBG("Aggressive read ahead is enabled.\n");
     }
     else if (env_val && strncasecmp(env_val, "dis", 3) == 0)
     {
         fadvice = POSIX_FADV_RANDOM;
-        fprintf(stderr, "Read ahead is disabled.\n");
+        DRAGON_PRINT_DBG("Read ahead is disabled.\n");
     }
     else
         fadvice = POSIX_FADV_NORMAL;
@@ -155,19 +176,16 @@ static dragonError_t init_module()
     }
 
     if (request.gdirect_num_groups > 0)
-        fprintf(stderr, "Request DRAGON-DIRECT setup\n");
-
-    if (request.gdirect_num_groups > 1)
-        fprintf(stderr, "Request DRAGON-DIRECT readahead support\n");
+        DRAGON_PRINT_DBG("Request DRAGON-DIRECT support with %u buffer groups\n", request.gdirect_num_groups);
 
     if ((status = ioctl(nvidia_uvm_fd, DRAGON_IOCTL_INIT, &request)) != 0)
     {
-        fprintf(stderr, "ioctl init error: %d\n", status);
+        DRAGON_PRINT_DBG("ioctl init error: %d\n", status);
         return D_ERR_IOCTL;
     }
     if (request.status)
     {
-        fprintf(stderr, "ioctl uvm init error: %u\n", request.status);
+        DRAGON_PRINT_DBG("ioctl uvm init error: %u\n", request.status);
         return D_ERR_IOCTL;
     }
 
@@ -188,7 +206,7 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
 
     if ((request = (dragon_ioctl_map_t *)calloc(1, sizeof(dragon_ioctl_map_t))) == NULL)
     {
-        fprintf(stderr, "Cannot calloc dragon_ioctl_map_t\n");
+        DRAGON_PRINT_DBG("Cannot calloc dragon_ioctl_map_t\n");
         ret = D_ERR_MEM;
         goto _out_err_0;
     }
@@ -196,7 +214,7 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
     error = cudaMallocManaged(&uvm_buf, size >= MIN_SIZE ? size : MIN_SIZE, cudaMemAttachGlobal);
     if (error != cudaSuccess)
     {
-        fprintf(stderr, "cudaMallocManaged error: %s %s\n", cudaGetErrorName(error), cudaGetErrorString(error));
+        DRAGON_PRINT_DBG("cudaMallocManaged error: %s %s\n", cudaGetErrorName(error), cudaGetErrorString(error));
         ret = D_ERR_UVM;
         goto _out_err_1;
     }
@@ -220,7 +238,7 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
     {
         if (flags & ~(D_F_READ | D_F_WRITE | D_F_DIRECT | D_F_CREATE))
         {
-            fprintf(stderr, "D_F_DIRECT can be used with D_F_READ, D_F_WRITE, and/or D_F_CREATE only\n");
+            DRAGON_PRINT_DBG("D_F_DIRECT can be used with D_F_READ, D_F_WRITE, and/or D_F_CREATE only\n");
             ret = D_ERR_INTVAL;
             goto _out_err_2;
         }
@@ -229,14 +247,14 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
 
     if ((request->backing_fd = open(filename, f_flags)) < 0)
     {
-        fprintf(stderr, "Cannot open the file %s\n", filename);
+        DRAGON_PRINT_DBG("Cannot open the file %s\n", filename);
         ret = D_ERR_FILE;
         goto _out_err_2;
     }
 
     if ((flags & D_F_CREATE) && ftruncate(request->backing_fd, size) != 0)
     {
-        fprintf(stderr, "Cannot truncate the file %s\n", filename);
+        DRAGON_PRINT_DBG("Cannot truncate the file %s\n", filename);
         ret = D_ERR_FILE;
         goto _out_err_3;
     }
@@ -244,9 +262,9 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
     if ((flags & D_F_READ) && !(flags & D_F_VOLATILE))
     {
         if ((status = posix_fadvise(request->backing_fd, 0, 0, fadvice)) != 0)
-            fprintf(stderr, "fadvise error: %d\n", status);
+            DRAGON_PRINT_DBG("fadvise error: %d\n", status);
         if ((fadvice == POSIX_FADV_SEQUENTIAL) && readahead(request->backing_fd, 0, size) != 0)
-            fprintf(stderr, "readahead error.\n");
+            DRAGON_PRINT_DBG("readahead error.\n");
     }
 
     flags = flags & ~D_F_CREATE;
@@ -257,13 +275,13 @@ dragonError_t dragon_map(const char *filename, size_t size, unsigned int flags, 
 
     if ((status = ioctl(nvidia_uvm_fd, DRAGON_IOCTL_MAP, request)) != 0)
     {
-        fprintf(stderr, "ioctl error: %d\n", status);
+        DRAGON_PRINT_DBG("ioctl error: %d\n", status);
         ret = D_ERR_IOCTL;
         goto _out_err_3;
     }
     if (request->status)
     {
-        fprintf(stderr, "ioctl uvm error: %u\n", request->status);
+        DRAGON_PRINT_DBG("ioctl uvm error: %u\n", request->status);
         ret = D_ERR_IOCTL;
         goto _out_err_3;
     }
@@ -291,7 +309,7 @@ dragonError_t dragon_remap(void *addr, unsigned int flags)
 
     if (request == NULL)
     {
-        fprintf(stderr, "%p is not mapped via dragon_map\n", addr);
+        DRAGON_PRINT_DBG("%p is not mapped via dragon_map\n", addr);
         return D_ERR_INTVAL;
     }
 
@@ -301,12 +319,12 @@ dragonError_t dragon_remap(void *addr, unsigned int flags)
 
     if ((status = ioctl(nvidia_uvm_fd, DRAGON_IOCTL_REMAP, request)) != 0)
     {
-        fprintf(stderr, "ioctl error: %d\n", status);
+        DRAGON_PRINT_DBG("ioctl error: %d\n", status);
         return D_ERR_IOCTL;
     }
     if (request->status)
     {
-        fprintf(stderr, "ioctl uvm error: %u\n", request->status);
+        DRAGON_PRINT_DBG("ioctl uvm error: %u\n", request->status);
         return D_ERR_IOCTL;
     }
 
@@ -334,7 +352,7 @@ dragonError_t dragon_unmap(void *addr)
 
     if (request == NULL)
     {
-        fprintf(stderr, "%p is not mapped via dragon_map\n", addr);
+        DRAGON_PRINT_DBG("%p is not mapped via dragon_map\n", addr);
         return D_ERR_INTVAL;
     }
 
